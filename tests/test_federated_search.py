@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import sys
@@ -972,3 +973,55 @@ class TestFederatedSearchHealthCache:
             result = provider.search("test", limit=5)
             assert result["success"] is False
             assert "No backends available" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Context propagation into worker threads
+# ---------------------------------------------------------------------------
+
+
+class TestContextPropagation:
+    """Backend worker threads must inherit the caller's ContextVars.
+
+    Under multiplexed hosting the profile secret scope is a ContextVar, and a
+    fresh ThreadPoolExecutor worker starts with an empty context. Without
+    copy_context() the backend calls inside the workers fail closed with
+    UnscopedSecretError — every federated search failed on the desktop /
+    multiplexed serve while single-profile runs worked (2026-10-12).
+    """
+
+    def test_worker_threads_inherit_calling_context(
+        self, provider: FederatedSearchProvider,
+    ) -> None:
+        scope = contextvars.ContextVar("federated_scope_probe", default=None)
+        seen: list = []
+
+        def fake_search(backend, query, limit):
+            seen.append(scope.get())
+            return ([{"title": "C", "url": "https://c.com", "description": ""}], None)
+
+        config = {
+            "backends": [
+                {"name": "alpha", "type": "custom"},
+                {"name": "beta", "type": "custom"},
+            ],
+            "timeout": 5,
+            "max_results": 5,
+        }
+
+        token = scope.set("ACTIVE")
+        try:
+            with patch(
+                "provider._read_config",
+                return_value=config,
+            ), patch(
+                "provider._search_one_backend",
+                side_effect=fake_search,
+            ):
+                result = provider.search("ctx", limit=3)
+        finally:
+            scope.reset(token)
+
+        assert result["success"] is True
+        # Both workers must observe the caller's context value.
+        assert seen == ["ACTIVE", "ACTIVE"]

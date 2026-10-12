@@ -52,6 +52,7 @@ Configuration in config.yaml::
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -650,8 +651,16 @@ class FederatedSearchProvider(WebSearchProvider):
                 max_workers=min(len(active_backends), _MAX_K),
             )
             try:
+                # Fresh worker threads do not inherit the caller's ContextVars
+                # (profile home override + secret scope). Under multiplexed
+                # hosting a bare worker's credential reads fail closed with
+                # UnscopedSecretError; run each worker in a copy of the caller's
+                # context — the same pattern as in-tree cron/scheduler_delivery.py.
                 futures = {
-                    pool.submit(_search_one_backend, b, query, limit): b
+                    pool.submit(
+                        contextvars.copy_context().run,
+                        _search_one_backend, b, query, limit,
+                    ): b
                     for b in active_backends
                 }
 
