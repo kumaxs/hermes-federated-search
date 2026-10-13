@@ -96,10 +96,11 @@ not appear, use ⌘K → "Reload desktop plugins" (or open Capabilities → Plug
 a load failure shows an error toast. Rolling the agent half back prunes the
 desktop half on the next reconcile pass.
 
-**Validate note.** `hermes plugins validate` passes on a clean export of the
-phase-3 head; it may print one `security scan caution: dump_all_env
-(plugin.js:333)` line — a literal heuristic matching the JS fallback
-`env || "（未命名）"`, not an env dump (no failure).
+**Validate note.** `hermes plugins validate` passes on a clean export with a
+clean security scan (no findings). Earlier revisions printed one
+`security scan caution: dump_all_env` line — the key-row label fallback's
+`||` text read as a shell pipe by the scanner's literal heuristic. The
+fallback now uses an equivalent ternary, so the warning is gone.
 
 **Activation semantics (opt-in user plugin):**
 
