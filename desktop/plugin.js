@@ -431,7 +431,7 @@ function keyCardView(line, lineIndex, keyIndex, env, handlers) {
 					"aria-label": "参与",
 					onCheckedChange: () => handlers.onExcludeKey(lineIndex, keyIndex)
 				}),
-				jsx("span", { className: "min-w-0 truncate font-mono text-xs", children: env || "（未命名）" }),
+				jsx("span", { className: "min-w-0 truncate font-mono text-xs", children: env ? env : "（未命名）" }),
 				jsx(Button, {
 					variant: "ghost",
 					size: "sm",
