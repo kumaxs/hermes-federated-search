@@ -1,7 +1,7 @@
 name: hermes-federated-search
 version: 1.0.0
 manifest_version: 2
-description: "Federated search — aggregate results from multiple search backends (Tavily, SearXNG, custom HTTP endpoints, etc.) with optional LLM-based relevance ranking and per-line multi-card credential pools. Configure via Settings → Plugins or web.federated in config.yaml."
+description: "Federated search — aggregate results from multiple search backends (Tavily, SearXNG, custom HTTP endpoints, etc.) with optional LLM-based relevance ranking and per-line multi-card credential pools. Configure via Settings → Plugins (card editor + Agent settings) or by editing the string (docs/agent-config.md)."
 author: kumaxs
 license: MIT
 homepage: https://github.com/kumaxs/hermes-federated-search

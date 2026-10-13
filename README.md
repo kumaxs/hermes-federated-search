@@ -38,6 +38,26 @@ Two additions on top of v1.0.0 (branch `feat/p2-config-multicard`):
   request fails over to the next usable card. Key values stay in the runtime
   environment — only names ever go into configuration.
 
+## What's New in Phase 3
+
+A human-facing card editor on top of the Phase 2 settings exposure
+(branch `feat/p3-card-config-ui`):
+
+- **Card-per-line config page** under Settings → Plugins → 「聚合搜索」
+  (`desktop/plugin.js`, registered via `ctx.registerSettingsPage`): one card
+  per line with two levels of membership — L1 参与聚合 (member of `backends`)
+  and L2 参与 (member of that line's `credentials`); add/remove lines and keys;
+  every edit serializes and writes straight back through
+  `plugins.manage settings`, then re-reads. The manifest `config_schema` form
+  stays available as the entry's **Agent settings** sub-page.
+- **String ↔ UI parity.** The page shows the current settings string (YAML/JSON
+  for agents) and takes a pasted string back; the settings tree stays the one
+  source of truth — unchecking a box removes the member from the string, with
+  no private residue.
+- **Credential policy unchanged and visible:** the page records environment
+  variable NAMES only — no value input, no value echo. Values go through
+  Settings → Keys (`PUT /api/env`). See `docs/agent-config.md`.
+
 ## Install & Enable
 
 The plugin is a plain directory plugin (no Python packaging step). Install it
@@ -118,6 +138,37 @@ web:
 With this configuration, every `web_search` call queries both Tavily and MiniMax
 in parallel, merges results, ranks by keyword scoring, and returns up to 8
 results.
+
+## Agent: configure by string
+
+Both doors edit the same tree, so an agent can do the whole configuration by
+editing the string (or by pasting it into the card page):
+
+```yaml
+plugins:
+  entries:
+    hermes-federated-search:
+      settings:
+        backends:
+          - name: tavily
+            type: custom
+            base_url: "https://api.example.invalid/search"
+            credentials: [TAVILY_API_KEY, TAVILY_API_KEY_2]   # names only
+        min_backends: 1
+        ranking_mode: auto
+```
+
+- `plugins.entries.hermes-federated-search.settings` is the single source of
+  truth; legacy `web.federated` still works and merges per top-level key
+  (settings win). The card page never rewrites the legacy block.
+- `credentials` lists **environment variable names** (`^[A-Z][A-Z0-9_]{0,127}$`)
+  and nothing else — a pasted key value is rejected at config validation
+  without echoing it. Key values belong to Settings → Keys (`PUT /api/env`).
+- An explicit `k` must equal the number of `backends`; leave it out (the UI
+  does) and the line count is used. A mismatched explicit `k` is shown as a
+  warning bar — never rewritten automatically.
+- After a string edit, reopen the page to see it (open = refetch). Full guide:
+  [`docs/agent-config.md`](docs/agent-config.md).
 
 ## Configuration Reference
 
