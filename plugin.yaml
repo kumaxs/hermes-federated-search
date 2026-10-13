@@ -1,0 +1,14 @@
+name: hermes-federated-search
+version: 1.0.0
+description: "Federated search — aggregate results from multiple search backends (Tavily, SearXNG, custom HTTP endpoints, etc.) with optional LLM-based relevance ranking. Configure sub-backends under web.federated.backends."
+author: kumaxs
+license: MIT
+homepage: https://github.com/kumaxs/hermes-federated-search
+requires_hermes: ">=0.21.5"
+tags:
+  - web-search
+  - search
+  - federated
+kind: backend
+provides_web_providers:
+  - federated
