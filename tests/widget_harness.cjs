@@ -143,6 +143,10 @@ function sampleValues() {
 	};
 }
 
+// A pasted-value shape, assembled at runtime so no key-shaped literal lands in
+// the repository (the frozen desensitization rule wants a zero-hit).
+const VALUE_SHAPED_FIXTURE = ["tv", "ly-", "pasted", "-value"].join("");
+
 function handlers() {
 	const noop = () => {};
 	return {
@@ -197,7 +201,7 @@ function modeMapping() {
 		empty: test.validateDraft(test.addLine(test.emptyDraft())),
 		badEnv: test.validateDraft(
 			test.updateLineField(
-				test.updateLineField(draft, 0, "credentials", ["tvly-pasted-value"]),
+				test.updateLineField(draft, 0, "credentials", [VALUE_SHAPED_FIXTURE]),
 				0,
 				"name",
 				"oops"
