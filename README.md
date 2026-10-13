@@ -25,8 +25,9 @@ tool chain are required.
 
 Two additions on top of v1.0.0 (branch `feat/p2-config-multicard`):
 
-- **Settings-page exposure.** The plugin declares six keys (`backends`,
-  `timeout`, `max_results`, `min_backends`, `ranking_mode`, `pool_strategy`)
+- **Settings-page exposure.** The plugin declares seven keys (`backends`,
+  `timeout`, `max_results`, `min_backends`, `ranking_mode`, `pool_strategy`,
+  `ranker`)
   through the official `config_schema` mechanism (manifest v2), so
   Settings → Plugins renders an editable form and saves them under
   `plugins.entries.hermes-federated-search.settings`. Values merge per
@@ -129,10 +130,15 @@ phase-3 head; it may print one `security scan caution: dump_all_env
 - Desktop (phase 3): Settings → Plugins → 「聚合搜索」 opens the card page —
   one card per line with two membership levels (L1 参与聚合 = member of
   `backends`; L2 参与 = member of the line's `credentials`), add/remove for
-  lines and keys, and the 当前配置字符串 box with paste-import. Every edit
-  serializes and is written back through `plugins.manage settings`; reopen the
-  page to re-read the saved string. The six-key `config_schema` form stays
-  available as the "Agent settings" sub-page.
+  lines and keys, a per-line 「Key 轮换策略（pool_strategy）」 select and the
+  当前配置字符串 box with paste-import. Every edit serializes and is written
+  back through `plugins.manage settings`; reopen the page to re-read the saved
+  string. The seven-key `config_schema` form stays available as the "Agent
+  settings" sub-page.
+- Desktop half is opt-in: the `.hermes-package.json` bundle ships it disabled
+  by default — enable it via 桌面 Hermes → 设置 → 技能与工具 → 插件 → open
+  hermes-federated-search, then 设置 → 插件 →「聚合搜索」 (full path and the
+  ⌘K →「Reload desktop plugins」 fallback: `docs/agent-config.md`).
 
 **Disable / roll back:**
 
@@ -205,9 +211,9 @@ top-level key, with the official settings tree winning:
 
 - **Settings → Plugins** (official form). Values are stored under
   `plugins.entries.hermes-federated-search.settings` in `config.yaml`. The
-  six keys declared by the plugin (`plugin.yaml` `config_schema`):
+  seven keys declared by the plugin (`plugin.yaml` `config_schema`):
   `backends`, `timeout`, `max_results`, `min_backends`, `ranking_mode`,
-  `pool_strategy`.
+  `pool_strategy`, `ranker`.
 - **`web.federated`** in `config.yaml` — the legacy location, still fully
   supported; no migration is required.
 
@@ -221,12 +227,12 @@ use the settings page (or edit `config.yaml` directly) instead.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `timeout` | int | `10` | Maximum seconds to wait for all backends. If the deadline expires, partial results from completed backends are returned. |
+| `timeout` | int | `10` | Total deadline for all backends. Lines that miss it are dropped; lines that already returned contribute their partial results. |
 | `max_results` | int | `8` | Maximum number of results returned after ranking (ceiling). The caller's `limit` parameter is still respected — the actual output count is `min(limit, max_results)`. |
 | `k` | int | len(backends) | **K-way aggregation.** Must equal the number of configured backends. When explicitly set, the plugin validates `len(backends) == k`. Maximum 32. |
-| `min_backends` | int | `1` | Minimum number of backends that must succeed for the search to be considered successful. Must satisfy `1 ≤ min_backends ≤ k`. |
+| `min_backends` | int | `1` | Minimum number of backends that must **return results** for the search to be considered successful. A line succeeds when it answers with a result-bearing response within the deadline. Must satisfy `1 ≤ min_backends ≤ k`; `required` lines must always succeed. |
 | `ranking_mode` | str | `auto` | Ranking mode: `auto` (follows `ranker.provider` as before), `keyword` (force keyword scoring), `llm` (force LLM ranking; uses the default auxiliary model when `ranker.provider` is unset). The `ranker` dict stays usable alongside. |
-| `pool_strategy` | str | `fill_first` | Multi-card rotation for custom lines with `credentials`: `fill_first` (use one card until it fails), `round_robin` (rotate per request), `random`. Overridable per line. |
+| `pool_strategy` | str | `fill_first` | Global default rotation for custom lines with `credentials`: `fill_first` (use one card until it fails), `round_robin` (rotate per request), `random`. Overridable per line (the card editor exposes the select inside each line card); the key itself is kept and stays read+write for compatibility. |
 | `ranker` | dict | — | Optional LLM ranking configuration (see below). |
 | `health_check` | dict | — | Optional cached health probing (see below). When absent, all backends are dispatched directly (backward compatible). |
 | `backends` | list | — | **Required.** List of sub-backend configurations. |
@@ -510,10 +516,19 @@ v1.0.0 base plus the phase-2 and phase-3 improvements:
   (`desktop/plugin.js`, `ctx.registerSettingsPage`) — one card per line with
   L1/L2 membership checkboxes, add/remove lines and keys, current-settings
   string with paste import, string ↔ UI parity (unchecking removes the member,
-  no private state); the six-key form stays as the Agent settings sub-page;
+  no private state); the schema form stays as the Agent settings sub-page;
   plus `docs/agent-config.md` (agent-side configuration guide) and the
   desktop-widget test harness (`tests/test_desktop_widget.py`,
   `tests/widget_harness.cjs`).
+- **Included (phase 3 revision, v1.1.0):** agent guidance aligned with the
+  real enable path (opt-in desktop half, `docs/agent-config.md` + in-page 指引
+  dialog); type select/badge removed — typeless lines stay typeless, new
+  cards are `custom`, legacy cards keep `api_key_env`/`required`/unknown keys
+  verbatim; a ranker model picker on the card page (`ranker` joins
+  `config_schema`, written as a whole tree via `settings.ranker`); the pool
+  strategy select moved into each line card (`pool_strategy` per line, the
+  global key stays a read+write default); timeout / min_backends wording
+  aligned with the runtime semantics.
 - **Not included:** multi-card on registered providers (host interface takes
   no key) and direct credential-pool (`auth.json`) consumption — future
   increments; per-backend `timeout` / `weight` / `result_limit` —
