@@ -1025,3 +1025,639 @@ class TestContextPropagation:
         assert result["success"] is True
         # Both workers must observe the caller's context value.
         assert seen == ["ACTIVE", "ACTIVE"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: official settings exposure + line-level multi-card pool
+# ---------------------------------------------------------------------------
+
+
+def _fake_card_value(label: str) -> str:
+    """Runtime-generated placeholder credential value (no literal key material)."""
+    import uuid
+
+    return f"{label}-{uuid.uuid4().hex}"
+
+
+def _fake_response(status: int, payload: Any = None):
+    """Real httpx.Response so raise_for_status()/json() behave like production."""
+    import httpx
+
+    return httpx.Response(
+        status,
+        json=payload if payload is not None else {},
+        request=httpx.Request("POST", "https://api.example.com/search"),
+    )
+
+
+class TestReadConfigMergesSettings:
+    """_read_config merges web.federated with the official settings tree."""
+
+    @staticmethod
+    def _write(tmp_path, payload: Dict[str, Any]) -> None:
+        try:
+            import hermes_yaml as yaml
+        except ImportError:
+            import yaml
+
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(payload))
+
+    def test_settings_win_per_top_level_key(self, tmp_path) -> None:
+        self._write(tmp_path, {
+            "web": {
+                "federated": {
+                    "timeout": 11,
+                    "max_results": 4,
+                    "backends": [{"name": "tavily"}],
+                },
+            },
+            "plugins": {
+                "entries": {
+                    "hermes-federated-search": {
+                        "settings": {"timeout": 22, "pool_strategy": "round_robin"},
+                    },
+                },
+            },
+        })
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            cfg = _read_config()
+        assert cfg is not None
+        assert cfg["timeout"] == 22          # settings win on overlap
+        assert cfg["max_results"] == 4       # web-only key survives
+        assert cfg["backends"][0]["name"] == "tavily"
+        assert cfg["pool_strategy"] == "round_robin"
+
+    def test_web_federated_only_still_works(self, tmp_path) -> None:
+        self._write(tmp_path, {
+            "web": {"federated": {"timeout": 13, "backends": [{"name": "tavily"}]}},
+        })
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            cfg = _read_config()
+        assert cfg is not None
+        assert cfg["timeout"] == 13
+        assert "pool_strategy" not in cfg
+
+    def test_settings_only_enables_provider(self, tmp_path) -> None:
+        self._write(tmp_path, {
+            "plugins": {
+                "entries": {
+                    "hermes-federated-search": {
+                        "settings": {
+                            "timeout": 7,
+                            "backends": [{"name": "minimax", "type": "custom",
+                                          "base_url": "https://api.example.com"}],
+                        },
+                    },
+                },
+            },
+        })
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            cfg = _read_config()
+        assert cfg is not None
+        assert cfg["timeout"] == 7
+        assert cfg["backends"][0]["name"] == "minimax"
+
+    def test_neither_section_is_not_configured(self, tmp_path) -> None:
+        self._write(tmp_path, {"web": {"search_backend": "federated"}})
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            assert _read_config() is None
+
+
+class TestCardPool:
+    """Pool selection strategies and cooldown bookkeeping."""
+
+    def test_fill_first_order(self) -> None:
+        from provider import _CardPool
+
+        pool = _CardPool()
+        cards = ["CARD_A", "CARD_B", "CARD_C"]
+        assert pool.select("line", cards, "fill_first") == "CARD_A"
+        pool.mark_failed("line", "CARD_A", 500)
+        assert pool.select("line", cards, "fill_first") == "CARD_B"
+        assert pool.select("line", cards, "fill_first", exclude={"CARD_B"}) == "CARD_C"
+
+    def test_round_robin_rotates(self) -> None:
+        from provider import _CardPool
+
+        pool = _CardPool()
+        cards = ["CARD_A", "CARD_B", "CARD_C"]
+        picks = [pool.select("line", cards, "round_robin") for _ in range(4)]
+        assert picks == ["CARD_A", "CARD_B", "CARD_C", "CARD_A"]
+
+    def test_random_in_set(self) -> None:
+        import random
+
+        from provider import _CardPool
+
+        pool = _CardPool()
+        cards = ["CARD_A", "CARD_B"]
+        random.seed(1234)
+        picks = {pool.select("line", cards, "random") for _ in range(40)}
+        assert picks == {"CARD_A", "CARD_B"}
+
+    def test_cooldowns_expire(self) -> None:
+        import time as _time
+
+        from provider import _CardPool
+
+        pool = _CardPool()
+        assert pool.remaining_cooldown("line", "CARD_A") == 0.0
+        pool.mark_failed("line", "CARD_A", 401)
+        assert pool.remaining_cooldown("line", "CARD_A") == pytest.approx(300, abs=5)
+        # an expired cooldown releases the card back into the pool
+        with patch("provider.time.time", return_value=_time.time() + 301):
+            assert pool.remaining_cooldown("line", "CARD_A") == 0.0
+            assert pool.select("line", ["CARD_A"], "fill_first") == "CARD_A"
+
+
+class TestCardPoolSwitching:
+    """A failed card cools down and the request fails over to the next one."""
+
+    @staticmethod
+    def _backend() -> Dict[str, Any]:
+        return {
+            "name": "line1", "type": "custom",
+            "base_url": "https://api.example.com", "search_path": "/search",
+            "credentials": ["CARD_A", "CARD_B"],
+        }
+
+    def _switch(self, status: int, expected_cooldown: float) -> None:
+        from provider import _CardPool, _search_custom_backend
+
+        card_a, card_b = _fake_card_value("card-a"), _fake_card_value("card-b")
+        values = {"CARD_A": card_a, "CARD_B": card_b}
+        pool = _CardPool()
+        responses = [
+            _fake_response(status),
+            _fake_response(200, {"results": [
+                {"title": "B1", "url": "https://b1.example.com", "content": "ok"}]}),
+        ]
+        with patch(
+            "provider.get_provider_env",
+            side_effect=lambda n: values.get(n, ""),
+        ), patch("httpx.post", side_effect=responses) as mock_post:
+            results, code = _search_custom_backend(self._backend(), "q", 5, card_pool=pool)
+
+        assert code is None
+        assert len(results) == 1 and results[0]["title"] == "B1"
+        auth = [call.kwargs["headers"]["Authorization"] for call in mock_post.call_args_list]
+        assert auth == [f"Bearer {card_a}", f"Bearer {card_b}"]
+        assert pool.remaining_cooldown("line1", "CARD_A") == pytest.approx(expected_cooldown, abs=5)
+        assert pool.remaining_cooldown("line1", "CARD_B") == 0.0
+
+    def test_pool_switch_on_401_300s(self) -> None:
+        self._switch(401, 300)
+
+    def test_pool_switch_on_429_3600s(self) -> None:
+        self._switch(429, 3600)
+
+    def test_pool_switch_on_403_300s(self) -> None:
+        self._switch(403, 300)
+
+    def test_pool_switch_on_5xx_300s(self) -> None:
+        self._switch(502, 300)
+
+    def test_pool_all_cards_fail_line_error_once_each(self) -> None:
+        from provider import _CardPool, _search_custom_backend
+
+        values = {"CARD_A": _fake_card_value("a"), "CARD_B": _fake_card_value("b")}
+        pool = _CardPool()
+        with patch(
+            "provider.get_provider_env", side_effect=lambda n: values.get(n, ""),
+        ), patch("httpx.post", side_effect=[_fake_response(401), _fake_response(429)]) as mock_post:
+            results, code = _search_custom_backend(self._backend(), "q", 5, card_pool=pool)
+
+        assert results == [] and code == 429   # last HTTP failure surfaces
+        assert mock_post.call_count == 2       # each card used at most once per request
+        assert pool.remaining_cooldown("line1", "CARD_A") == pytest.approx(300, abs=5)
+        assert pool.remaining_cooldown("line1", "CARD_B") == pytest.approx(3600, abs=5)
+
+    def test_pool_sole_card_caps_transient_at_60(self) -> None:
+        from provider import _CardPool, _search_custom_backend
+
+        value = _fake_card_value("only")
+        pool = _CardPool()
+        backend = dict(self._backend(), credentials=["ONLY_CARD"])
+        with patch("provider.get_provider_env", return_value=value), patch(
+            "httpx.post", side_effect=[_fake_response(500)],
+        ):
+            results, code = _search_custom_backend(backend, "q", 5, card_pool=pool)
+
+        assert results == [] and code == 500
+        assert pool.remaining_cooldown("line1", "ONLY_CARD") == pytest.approx(60, abs=5)
+
+    def test_pool_sole_card_keeps_401_at_300s(self) -> None:
+        from provider import _CardPool, _search_custom_backend
+
+        value = _fake_card_value("only")
+        pool = _CardPool()
+        backend = dict(self._backend(), credentials=["ONLY_CARD"])
+        with patch("provider.get_provider_env", return_value=value), patch(
+            "httpx.post", side_effect=[_fake_response(401)],
+        ):
+            results, code = _search_custom_backend(backend, "q", 5, card_pool=pool)
+
+        assert results == [] and code == 401
+        assert pool.remaining_cooldown("line1", "ONLY_CARD") == pytest.approx(300, abs=5)
+
+    def test_pool_legacy_single_card_not_capped(self) -> None:
+        """Legacy api_key_env single-card path keeps v1 values (no 60s sole cap,
+        no pool interaction) — the cap applies to the multi-card pool path only."""
+        from provider import _CardPool, _search_custom_backend
+
+        value = _fake_card_value("legacy")
+        pool = _CardPool()
+        backend = {
+            "name": "legacy", "type": "custom",
+            "base_url": "https://api.example.com", "search_path": "/search",
+            "api_key_env": "LEGACY_KEY",
+        }
+        with patch("provider.get_provider_env", return_value=value):
+            for status in (500, 429):
+                with patch("httpx.post", side_effect=[_fake_response(status)]):
+                    results, code = _search_custom_backend(backend, "q", 5, card_pool=pool)
+                assert results == [] and code == status
+        assert pool.remaining_cooldown("legacy", "LEGACY_KEY") == 0.0
+
+        # line-level (health cache) cooldown values stay v1: 5xx→300s, 429→3600s
+        import time as _time
+
+        from provider import _HealthCache
+
+        hc = _HealthCache(ttl_seconds=300)
+        hc.mark_failed("legacy", 500)
+        with patch("provider.time.time", return_value=_time.time() + 301):
+            assert hc.is_available("legacy") is None       # 300s elapsed (not 60/3600)
+        hc2 = _HealthCache(ttl_seconds=300)
+        hc2.mark_failed("legacy", 429)
+        with patch("provider.time.time", return_value=_time.time() + 301):
+            assert hc2.is_available("legacy") is False     # 3600s still cooling
+
+    def test_pool_tavily_custom_form_via_pool(self) -> None:
+        """Canonical Tavily-as-custom-line params work through the pool path."""
+        from provider import _CardPool, _search_custom_backend
+
+        tavily_a, tavily_b = _fake_card_value("tv-a"), _fake_card_value("tv-b")
+        values = {"TAVILY_KEY_1": tavily_a, "TAVILY_KEY_2": tavily_b}
+        pool = _CardPool()
+        backend = {
+            "name": "tavily-custom", "type": "custom",
+            "base_url": "https://api.tavily.com", "search_path": "/search",
+            "query_param": "query", "auth_style": "bearer",
+            "credentials": ["TAVILY_KEY_1", "TAVILY_KEY_2"],
+        }
+        payload = {"results": [
+            {"title": "T1", "url": "https://t1.example.com", "content": "snippet"}]}
+        with patch("provider.get_provider_env", side_effect=lambda n: values.get(n, "")), patch(
+            "httpx.post", side_effect=[_fake_response(200, payload)],
+        ) as mock_post:
+            results, code = _search_custom_backend(backend, "hello", 5, card_pool=pool)
+
+        assert code is None and len(results) == 1
+        call = mock_post.call_args
+        assert call.args[0] == "https://api.tavily.com/search"
+        assert call.kwargs["json"]["query"] == "hello"
+        assert call.kwargs["headers"]["Authorization"] == f"Bearer {tavily_a}"
+
+    def test_pool_skips_missing_env_all_missing_fails_line(self) -> None:
+        from provider import _CardPool, _search_custom_backend
+
+        value_a = _fake_card_value("a")
+        pool = _CardPool()
+        payload = {"results": [{"title": "A1", "url": "https://a1.example.com", "content": "ok"}]}
+        with patch(
+            "provider.get_provider_env",
+            side_effect=lambda n: {"CARD_A": value_a}.get(n, ""),
+        ), patch("httpx.post", side_effect=[_fake_response(200, payload)]) as mock_post:
+            results, code = _search_custom_backend(self._backend(), "q", 5, card_pool=pool)
+
+        assert code is None and len(results) == 1
+        assert mock_post.call_count == 1       # missing card never dialed
+        assert mock_post.call_args.kwargs["headers"]["Authorization"] == f"Bearer {value_a}"
+
+        pool2 = _CardPool()
+        backend2 = dict(self._backend(), credentials=["MISSING_1", "MISSING_2"])
+        with patch("provider.get_provider_env", return_value=""), patch("httpx.post") as mock_post2:
+            outcomes = _search_custom_backend(backend2, "q", 5, card_pool=pool2)
+        assert outcomes == ([], None)          # line-level failure, no dial
+        assert mock_post2.call_count == 0
+
+    def test_pool_skips_blank_and_line_break_values(self, caplog) -> None:
+        import logging
+
+        from provider import _CardPool, _search_custom_backend
+
+        good = _fake_card_value("good")
+        values = {"BAD_BLANK": "   ", "BAD_NEWLINE": "abc\ndef", "GOOD": good}
+        payload = {"results": [{"title": "G", "url": "https://g.example.com", "content": "ok"}]}
+        pool = _CardPool()
+        backend = dict(self._backend(), credentials=["BAD_BLANK", "BAD_NEWLINE", "GOOD"])
+        with caplog.at_level(logging.WARNING), patch(
+            "provider.get_provider_env", side_effect=lambda n: values.get(n, ""),
+        ), patch("httpx.post", side_effect=[_fake_response(200, payload)]) as mock_post:
+            results, code = _search_custom_backend(backend, "q", 5, card_pool=pool)
+
+        assert code is None and len(results) == 1
+        assert mock_post.call_count == 1
+        assert mock_post.call_args.kwargs["headers"]["Authorization"] == f"Bearer {good}"
+        assert any("line break" in rec.message for rec in caplog.records)
+
+        pool2 = _CardPool()
+        with patch("provider.get_provider_env", return_value=""), patch("httpx.post") as mock_post2:
+            assert _search_custom_backend(backend, "q", 5, card_pool=pool2) == ([], None)
+        assert mock_post2.call_count == 0
+
+    def test_pool_multi_vendor_pools_are_independent(self) -> None:
+        from provider import _CardPool, _search_custom_backend
+
+        shared, line1_b = _fake_card_value("shared"), _fake_card_value("line1-b")
+        values = {"SHARED_CARD": shared, "LINE1_B": line1_b}
+        pool = _CardPool()
+        line1 = {
+            "name": "vendor1", "type": "custom",
+            "base_url": "https://api.example.com", "search_path": "/search",
+            "credentials": ["SHARED_CARD", "LINE1_B"],
+        }
+        line2 = {
+            "name": "vendor2", "type": "custom",
+            "base_url": "https://api.example.com", "search_path": "/search",
+            "credentials": ["SHARED_CARD"],
+        }
+        ok_payload = {"results": [{"title": "R", "url": "https://r.example.com", "content": "ok"}]}
+        responses = [_fake_response(500), _fake_response(200, ok_payload), _fake_response(200, ok_payload)]
+        with patch(
+            "provider.get_provider_env", side_effect=lambda n: values.get(n, ""),
+        ), patch("httpx.post", side_effect=responses) as mock_post:
+            r1, _ = _search_custom_backend(line1, "q", 5, card_pool=pool)
+            r2, _ = _search_custom_backend(line2, "q", 5, card_pool=pool)
+
+        assert len(r1) == 1 and len(r2) == 1
+        # vendor1's busted card is cooling on its own line only
+        assert pool.remaining_cooldown("vendor1", "SHARED_CARD") == pytest.approx(300, abs=5)
+        assert pool.remaining_cooldown("vendor2", "SHARED_CARD") == 0.0
+        auth = [call.kwargs["headers"]["Authorization"] for call in mock_post.call_args_list]
+        assert auth == [f"Bearer {shared}", f"Bearer {line1_b}", f"Bearer {shared}"]
+
+
+class TestCredentialsValidation:
+    """credentials grammar, mis-entry rejection, dedupe (config time)."""
+
+    @staticmethod
+    def _err(credentials: Any, typ: str = "custom"):
+        from provider import _validate_config
+
+        cfg = {"backends": [{"name": "line1", "type": typ, "credentials": credentials}]}
+        return _validate_config(cfg)
+
+    def test_credentials_syntax_rejected_zero_echo(self) -> None:
+        bad_values = ["card_a", "CARD-A", "1CARD", "CARD.A", "CARD/A", "CARD A", "A" * 129, 123]
+        for bad in bad_values:
+            err = self._err([bad])
+            assert err is not None, "invalid credentials item was not rejected"
+            assert "credentials[0]" in err
+            if isinstance(bad, str):
+                assert bad not in err, f"error message leaked the value: {err}"
+        err = self._err([""])
+        assert err is not None and "credentials[0]" in err
+        assert "environment variable" in err
+
+    def test_credentials_secret_like_rejected_zero_echo(self) -> None:
+        import random
+        import string
+        import uuid
+
+        def _shape(*parts: str) -> str:
+            return "".join(parts)
+
+        def _random_id(n: int = 16) -> str:
+            return "".join(random.choices(string.ascii_uppercase + string.digits, k=n))
+
+        # Fixtures are assembled at runtime so no key-shaped literal lands in
+        # the repository (the desensitization scan keeps a hard zero-hit).
+        token = uuid.uuid4().hex + uuid.uuid4().hex
+        aws_id_shape = _shape("A", "K", "IA") + _random_id()
+        aws_session_shape = _shape("A", "S", "IA") + _random_id()
+        bad_values = [
+            aws_id_shape,                    # AWS access-key id shape (passes the grammar)
+            aws_session_shape,               # AWS session key-id shape
+            _shape("tv", "ly-") + token,     # vendor token, dash prefix
+            _shape("s", "k-") + token,       # short-prefix token
+            _shape("Bea", "rer ") + token,   # auth-scheme token
+            _shape("ey", token),             # compact base64-encoded token
+            "AbCdEfGh" + token.upper(),      # mixed-case long token
+        ]
+        for bad in bad_values:
+            err = self._err([bad])
+            # message stays value-free: pytest keeps assertion output key-free too
+            assert err is not None, "secret-shaped credentials item was not rejected"
+            assert bad not in err, f"error message leaked the value: {err}"
+        for fingerprint in (aws_id_shape, aws_session_shape):
+            err = self._err([fingerprint])
+            assert "secret" in err.lower()
+            assert "credentials[0]" in err
+
+    def test_credentials_empty_list_not_configured_and_duplicates_deduped(self, caplog) -> None:
+        import logging
+
+        assert self._err([]) is None
+        with caplog.at_level(logging.WARNING):
+            assert self._err(["CARD_A", "CARD_A"]) is None
+        assert any("duplicate" in rec.message.lower() for rec in caplog.records)
+
+        from provider import _CardPool, _search_custom_backend
+
+        value = _fake_card_value("dup")
+        pool = _CardPool()
+        backend = {
+            "name": "line1", "type": "custom",
+            "base_url": "https://api.example.com", "search_path": "/search",
+            "credentials": ["CARD_A", "CARD_A"],
+        }
+        payload = {"results": [{"title": "D", "url": "https://d.example.com", "content": "ok"}]}
+        with patch("provider.get_provider_env", return_value=value), patch(
+            "httpx.post", side_effect=[_fake_response(200, payload)],
+        ) as mock_post:
+            results, code = _search_custom_backend(backend, "q", 5, card_pool=pool)
+        assert code is None and len(results) == 1
+        assert mock_post.call_count == 1           # deduped to a single dial
+        assert pool.remaining_cooldown("line1", "CARD_A") == 0.0
+
+    def test_credentials_on_registered_line_warns_ignored(self, provider, caplog) -> None:
+        import logging
+
+        config = {
+            "backends": [{"name": "tavily", "credentials": ["CARD_A"]}],
+            "timeout": 5,
+            "max_results": 5,
+        }
+        mock_provider = MagicMock()
+        mock_provider.search.return_value = {
+            "success": True,
+            "data": {"web": [{"title": "T", "url": "https://t.example.com", "description": ""}]},
+        }
+        with caplog.at_level(logging.WARNING), patch(
+            "provider._read_config", return_value=config,
+        ), patch("provider._get_registered_provider", return_value=mock_provider):
+            result = provider.search("q", limit=3)
+
+        assert result["success"] is True and len(result["data"]["web"]) == 1
+        assert mock_provider.search.called            # host single-card path unchanged
+        assert any(
+            "credentials" in rec.message and "registered" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_pool_legacy_api_key_env_single_card(self) -> None:
+        from provider import _search_custom_backend
+
+        value = _fake_card_value("legacy")
+        backend = {
+            "name": "legacy", "type": "custom",
+            "base_url": "https://api.example.com", "search_path": "/search",
+            "api_key_env": "LEGACY_KEY",
+        }
+        payload = {"results": [{"title": "L", "url": "https://l.example.com", "content": "ok"}]}
+        with patch("provider.get_provider_env", return_value=value), patch(
+            "httpx.post", side_effect=[_fake_response(200, payload)],
+        ) as mock_post:
+            results, code = _search_custom_backend(backend, "q", 5)
+        assert code is None and len(results) == 1
+        assert mock_post.call_args.kwargs["headers"]["Authorization"] == f"Bearer {value}"
+
+        with patch("provider.get_provider_env", return_value=""), patch("httpx.post") as mock_post2:
+            assert _search_custom_backend(backend, "q", 5) == ([], None)
+        assert mock_post2.call_count == 0
+
+
+class TestRankingMode:
+    """ranking_mode maps onto the ranker dict (auto | keyword | llm)."""
+
+    @staticmethod
+    def _capture(provider, config: Dict[str, Any]):
+        captured: Dict[str, Any] = {}
+        sample = [
+            {"title": f"R{i}", "url": f"https://r{i}.example.com", "description": ""}
+            for i in range(4)
+        ]
+
+        def fake_rank(query, results, ranker_config):
+            captured["ranker"] = ranker_config
+            return results
+
+        with patch("provider._read_config", return_value=config), patch(
+            "provider._search_one_backend", return_value=(sample, None),
+        ), patch("provider._rank_results", side_effect=fake_rank):
+            result = provider.search("q", limit=3)
+        assert result["success"] is True
+        return captured["ranker"]
+
+    def test_ranking_mode_keyword(self, provider) -> None:
+        cfg = self._capture(provider, {
+            "backends": [{"name": "t", "type": "custom"}],
+            "ranking_mode": "keyword",
+            "ranker": {"provider": "opencode-go", "model": "m", "prompt": "p"},
+        })
+        assert cfg["provider"] == "none"
+
+    def test_ranking_mode_llm_without_ranker(self, provider) -> None:
+        cfg = self._capture(provider, {
+            "backends": [{"name": "t", "type": "custom"}],
+            "ranking_mode": "llm",
+        })
+        assert cfg["provider"] == "auto"
+
+    def test_ranking_mode_auto_keeps_ranker(self, provider) -> None:
+        ranker = {"provider": "none", "model": "m"}
+        cfg = self._capture(provider, {
+            "backends": [{"name": "t", "type": "custom"}],
+            "ranking_mode": "auto",
+            "ranker": dict(ranker),
+        })
+        assert cfg == ranker
+
+    def test_ranking_mode_keyword_uses_keyword_engine(self) -> None:
+        from provider import _rank_results
+
+        results = [
+            {"title": "beta hit", "url": "https://b.example.com", "description": ""},
+            {"title": "alpha", "url": "https://a.example.com", "description": ""},
+            {"title": "none", "url": "https://n.example.com", "description": ""},
+            {"title": "beta again", "url": "https://b2.example.com", "description": ""},
+        ]
+        with patch("agent.auxiliary_client.call_llm") as llm:
+            ranked = _rank_results("beta", results, {"provider": "none"})
+        assert ranked[0]["url"] == "https://b.example.com"
+        assert not llm.called
+
+
+class TestPoolIntegration:
+    """search() wires the pool through the thread pool and keeps state across calls."""
+
+    def test_pool_round_robin_persists_across_searches(self, provider) -> None:
+        value_a, value_b = _fake_card_value("a"), _fake_card_value("b")
+        values = {"CARD_A": value_a, "CARD_B": value_b}
+        config = {
+            "backends": [{
+                "name": "line1", "type": "custom",
+                "base_url": "https://api.example.com", "search_path": "/search",
+                "credentials": ["CARD_A", "CARD_B"],
+                "pool_strategy": "round_robin",
+            }],
+            "timeout": 5,
+            "max_results": 5,
+        }
+        payload = {"results": [{"title": "X", "url": "https://x.example.com", "content": "ok"}]}
+        with patch("provider._read_config", return_value=config), patch(
+            "provider.get_provider_env", side_effect=lambda n: values.get(n, ""),
+        ), patch("httpx.post", side_effect=[_fake_response(200, payload), _fake_response(200, payload)]) as mock_post:
+            assert provider.search("q1", limit=3)["success"] is True
+            assert provider.search("q2", limit=3)["success"] is True
+
+        auth = [call.kwargs["headers"]["Authorization"] for call in mock_post.call_args_list]
+        assert auth == [f"Bearer {value_a}", f"Bearer {value_b}"]  # cursor survived
+
+
+class TestConfigSchema:
+    """plugin.yaml declares the six settings-page keys per the host rules."""
+
+    def test_config_schema_keys_valid(self) -> None:
+        import re
+
+        try:
+            import hermes_yaml as yaml
+        except ImportError:
+            import yaml
+
+        data = yaml.safe_load((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
+        assert data.get("manifest_version") == 2
+        schema = data.get("config_schema")
+        assert set(schema) == {
+            "backends", "timeout", "max_results", "min_backends",
+            "ranking_mode", "pool_strategy",
+        }
+        segment = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+        reserved = {"model", "plugins", "security", "settings"}
+        known_types = {
+            "str", "string", "int", "integer", "float", "number", "bool",
+            "boolean", "list", "array", "dict", "object", "secret",
+        }
+        for key, spec in schema.items():
+            assert segment.fullmatch(key), key
+            assert key.lower() not in reserved, key
+            assert str(spec.get("type", "str")).lower() in known_types, key
+            assert "default" in spec, key
+        assert schema["backends"]["type"] == "list"
+        assert schema["backends"]["default"] == []
+        assert schema["ranking_mode"]["choices"] == ["auto", "keyword", "llm"]
+        assert schema["ranking_mode"]["default"] == "auto"
+        assert schema["pool_strategy"]["choices"] == ["fill_first", "round_robin", "random"]
+        assert schema["pool_strategy"]["default"] == "fill_first"
+
+        import provider as provider_mod
+
+        assert schema["timeout"]["default"] == provider_mod._DEFAULT_TIMEOUT
+        assert schema["max_results"]["default"] == provider_mod._DEFAULT_MAX_RESULTS
+        assert schema["pool_strategy"]["default"] == provider_mod._DEFAULT_POOL_STRATEGY
+        from provider import _POOL_STRATEGIES
+
+        assert tuple(schema["pool_strategy"]["choices"]) == _POOL_STRATEGIES

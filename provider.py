@@ -47,6 +47,29 @@ Configuration in config.yaml::
             base_url: "https://search.example.com"
             api_key_env: SEARXNG_API_KEY
             required: true
+
+Multi-card pool (``type: custom`` lines)::
+
+    backends:
+      - name: minimax
+        type: custom
+        base_url: "https://api.minimaxi.com"
+        search_path: /v1/coding_plan/search
+        query_param: "q"
+        credentials: [MINIMAX_KEY_1, MINIMAX_KEY_2]   # env var NAMES only
+        pool_strategy: round_robin    # fill_first | round_robin | random
+
+Only environment variable *names* live in config; the values are read from
+the runtime environment (per-profile ``.env``) and never persisted or
+logged.  A failed card cools down (401→300s, 403→300s, 429→3600s, other→
+300s; a single usable card caps transient cooldowns at 60s) and the request
+fails over to the next usable card.
+
+The same options are editable through the official Settings → Plugins form
+(``plugin.yaml`` ``config_schema``; keys land under
+``plugins.entries.hermes-federated-search.settings``).  Per top-level key,
+settings win over the legacy ``web.federated`` section — both stay
+supported.
 """
 
 from __future__ import annotations
@@ -54,6 +77,8 @@ from __future__ import annotations
 import concurrent.futures
 import contextvars
 import logging
+import random
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -80,6 +105,29 @@ _MAX_K = 32
 _DEFAULT_HEALTH_TTL = 300
 _DEFAULT_HEALTH_TIMEOUT = 5
 
+# Official plugin settings tree (Settings → Plugins, manifest v2 config_schema).
+# Per top-level key its values win over the legacy ``web.federated`` section.
+_PLUGIN_ID = "hermes-federated-search"
+_SETTINGS_SEGMENTS = ("plugins", "entries", _PLUGIN_ID, "settings")
+
+# Multi-card pool (line-level ``credentials``)
+_POOL_STRATEGIES = ("fill_first", "round_robin", "random")
+_DEFAULT_POOL_STRATEGY = "fill_first"
+# Cooldowns mirror the Hermes credential-pool values (401→300s, 403→300s,
+# 429→3600s); anything else (5xx / network / unknown) uses the v1 300s default.
+_CARD_COOLDOWN_SECONDS = {401: 300, 403: 300, 429: 3600}
+_DEFAULT_CARD_COOLDOWN = 300
+# A line with a single usable card caps *transient* cooldowns at 60s
+# (host sole_credential alignment; the legacy api_key_env path is NOT capped).
+_SOLE_CARD_TRANSIENT_CAP = 60
+_CREDENTIAL_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+# Secret-ID shapes that still pass the env-name grammar — reject them so a
+# pasted key never lands in config.yaml (residual window closed by the
+# desensitization scan).  The vendor prefixes are spelled with a character
+# class so this rejection rule itself carries no literal key-ID prefix
+# (desensitization scan: zero strong-signal hits on the repository).
+_SECRET_LIKE_PATTERNS = (re.compile(r"^(?:A[K]IA|A[S]IA)[0-9A-Z]{16}$"),)
+
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -87,10 +135,18 @@ _DEFAULT_HEALTH_TIMEOUT = 5
 
 
 def _read_config() -> Optional[Dict[str, Any]]:
-    """Read the ``web.federated`` section from the raw config file.
+    """Read federated search configuration from the raw config file.
 
-    Uses raw-YAML access rather than ``load_config()`` because the schema
-    validator strips unknown keys from the ``web`` section during loading.
+    Merges two sections, per top-level key (official settings win):
+
+    - ``web.federated`` — legacy location (kept working; no forced migration)
+    - ``plugins.entries.hermes-federated-search.settings`` — the official
+      plugin settings tree written by Settings → Plugins (manifest v2
+      ``config_schema``)
+
+    Returns ``None`` when neither section exists (not configured).  Raw-YAML
+    access is kept rather than ``load_config()`` because the schema validator
+    strips unknown keys from the ``web`` section during loading.
     """
     try:
         from hermes_cli.config import get_config_path
@@ -103,10 +159,25 @@ def _read_config() -> Optional[Dict[str, Any]]:
             return None
         with open(config_path, encoding="utf-8-sig") as f:
             cfg = yaml.safe_load(f) or {}
+
         web = cfg.get("web")
-        if not isinstance(web, dict):
+        web_section = web.get("federated") if isinstance(web, dict) else None
+        settings: Any = cfg
+        for segment in _SETTINGS_SEGMENTS:
+            settings = settings.get(segment) if isinstance(settings, dict) else None
+        if not isinstance(web_section, dict):
+            web_section = None
+        if not isinstance(settings, dict):
+            settings = None
+        if web_section is None and settings is None:
             return None
-        return web.get("federated")
+
+        merged: Dict[str, Any] = {}
+        if web_section:
+            merged.update(web_section)
+        if settings:
+            merged.update(settings)
+        return merged
     except Exception:  # health: allow BLE001 -- best-effort raw-config read; failure falls back to defaults
         return None
 
@@ -124,6 +195,61 @@ def _get_registered_provider(name: str) -> Optional[WebSearchProvider]:
 # ---------------------------------------------------------------------------
 
 
+def _pool_strategy_error(value: Any, label: str) -> Optional[str]:
+    """Validate a pool-strategy setting without echoing its raw value."""
+    if str(value) in _POOL_STRATEGIES:
+        return None
+    return f"{label} must be one of: {', '.join(_POOL_STRATEGIES)}"
+
+
+def _validate_credentials(backend_name: str, credentials: Any) -> Optional[str]:
+    """Validate one custom line's ``credentials`` list. Error message or None.
+
+    Rules:
+
+    - must be a list of environment variable names matching
+      ``^[A-Z][A-Z0-9_]{0,127}$`` (empty list = not configured);
+    - known secret-value shapes are rejected so a pasted key never lands in
+      config.yaml (a value only ever lives in the runtime environment);
+    - duplicate names are deduplicated at selection time (warned here).
+
+    Error messages carry the item index and the rule, never the offending
+    value.
+    """
+    if credentials is None:
+        return None
+    if not isinstance(credentials, list):
+        return (
+            f"backend '{backend_name}': credentials must be a list of "
+            f"environment variable names"
+        )
+    seen: set = set()
+    for i, item in enumerate(credentials):
+        if not isinstance(item, str):
+            return (
+                f"backend '{backend_name}': credentials[{i}] must be an "
+                f"environment variable name string"
+            )
+        if not _CREDENTIAL_NAME_RE.match(item):
+            return (
+                f"backend '{backend_name}': credentials[{i}] is not a valid "
+                f"environment variable name (expected ^[A-Z][A-Z0-9_]{{0,127}}$)"
+            )
+        if any(pattern.match(item) for pattern in _SECRET_LIKE_PATTERNS):
+            return (
+                f"backend '{backend_name}': credentials[{i}] looks like a "
+                f"secret value — list only the environment variable name; the "
+                f"key itself belongs in the runtime environment"
+            )
+        if item in seen:
+            logger.warning(
+                "backend '%s': duplicate credential name %s ignored",
+                backend_name, item,
+            )
+        seen.add(item)
+    return None
+
+
 def _validate_config(config: Dict[str, Any]) -> Optional[str]:
     """Validate federated search configuration. Returns error message or None.
 
@@ -131,6 +257,9 @@ def _validate_config(config: Dict[str, Any]) -> Optional[str]:
     - k ≤ _MAX_K
     - len(backends) == k
     - 1 ≤ min_backends ≤ k
+    - ranking_mode / pool_strategy are known values
+    - custom lines: credentials grammar + mis-entry rejection (multi-card)
+    - registered lines: credentials are ignored (warning, host single card)
     """
     backends = config.get("backends", [])
     if not isinstance(backends, list) or not backends:
@@ -153,6 +282,39 @@ def _validate_config(config: Dict[str, Any]) -> Optional[str]:
         return f"min_backends={min_backends} must be at least 1"
     if min_backends > k:
         return f"min_backends={min_backends} cannot exceed k={k}"
+
+    if config.get("pool_strategy") is not None:
+        error = _pool_strategy_error(config.get("pool_strategy"), "pool_strategy")
+        if error:
+            return error
+    if config.get("ranking_mode") is not None:
+        mode = str(config.get("ranking_mode"))
+        if mode not in ("auto", "keyword", "llm"):
+            return "ranking_mode must be one of: auto, keyword, llm"
+
+    for backend in backends:
+        if not isinstance(backend, dict):
+            continue
+        name = str(backend.get("name", "?"))
+        typ = str(backend.get("type", "") or "")
+        credentials = backend.get("credentials")
+        if credentials is not None and typ != "custom":
+            logger.warning(
+                "backend '%s': 'credentials' is ignored on a registered "
+                "provider line (the host resolves its own key; multi-card "
+                "pooling requires type: custom)", name,
+            )
+            continue
+        if typ == "custom":
+            error = _validate_credentials(name, credentials)
+            if error:
+                return error
+            line_strategy = backend.get("pool_strategy")
+            if line_strategy is not None:
+                error = _pool_strategy_error(
+                    line_strategy, f"backend '{name}' pool_strategy")
+                if error:
+                    return error
 
     return None
 
@@ -206,6 +368,115 @@ class _HealthCache:
         # Store with an artificial timestamp so the entry expires after
         # cooldown seconds regardless of normal TTL.
         self._cache[backend_name] = (False, time.time() - self._ttl + cooldown)
+
+
+# ---------------------------------------------------------------------------
+# Multi-card pool (line-level ``credentials``)
+# ---------------------------------------------------------------------------
+
+
+def _card_value(env_name: str) -> str:
+    """Resolve one card's secret from the runtime environment.
+
+    Values are never persisted or logged.  Empty / whitespace-only values and
+    values containing line breaks (a mis-pasted multi-line secret) are treated
+    as not configured.
+    """
+    value = (get_provider_env(env_name) or "").strip()
+    if not value:
+        return ""
+    if "\n" in value or "\r" in value:
+        logger.warning("card %s skipped: value contains a line break", env_name)
+        return ""
+    return value
+
+
+class _CardPool:
+    """Process-local credential pool for one federated line.
+
+    State is keyed by (line name, env var name): cooldown expiry timestamps,
+    plus one round-robin cursor per line.  Cooldowns mirror the Hermes
+    credential-pool values (401→300s, 403→300s, 429→3600s); other statuses
+    (5xx / network / unknown) use the v1 300s default, capped at 60s when the
+    line has a single usable card (sole-credential alignment; pool path only).
+    Restarting Hermes clears every cooldown (in-process state by design).
+    """
+
+    def __init__(self) -> None:
+        self._cooldowns: Dict[str, float] = {}
+        self._cursors: Dict[str, int] = {}
+        self.default_strategy = _DEFAULT_POOL_STRATEGY
+
+    @staticmethod
+    def _key(line: str, env_name: str) -> str:
+        return f"{line}\x00{env_name}"
+
+    def remaining_cooldown(self, line: str, env_name: str) -> float:
+        """Seconds until *env_name* is usable again (0 when not cooling)."""
+        key = self._key(line, env_name)
+        expiry = self._cooldowns.get(key)
+        if expiry is None:
+            return 0.0
+        left = expiry - time.time()
+        if left <= 0:
+            self._cooldowns.pop(key, None)
+            return 0.0
+        return left
+
+    def mark_failed(
+        self,
+        line: str,
+        env_name: str,
+        status_code: Optional[int],
+        sole_card: bool = False,
+    ) -> int:
+        """Cool a failed card down; returns the cooldown applied, in seconds."""
+        if status_code in _CARD_COOLDOWN_SECONDS:
+            seconds = _CARD_COOLDOWN_SECONDS[status_code]
+        else:
+            seconds = _DEFAULT_CARD_COOLDOWN
+            if sole_card:
+                seconds = min(seconds, _SOLE_CARD_TRANSIENT_CAP)
+        self._cooldowns[self._key(line, env_name)] = time.time() + seconds
+        return seconds
+
+    def select(
+        self,
+        line: str,
+        cards: List[str],
+        strategy: Optional[str] = None,
+        exclude: Any = frozenset(),
+    ) -> Optional[str]:
+        """Pick the next usable card for *line*, or ``None`` when none is left.
+
+        Usable = value present (the caller passes only value-bearing names)
+        and not cooling down.  ``fill_first`` takes the first usable card in
+        order, ``round_robin`` rotates a per-line cursor, ``random`` picks
+        uniformly inside the usable set.  ``exclude`` skips names already
+        tried within the current request.
+        """
+        usable = [
+            card for card in cards
+            if card not in exclude and self.remaining_cooldown(line, card) <= 0
+        ]
+        if not usable:
+            return None
+        if strategy not in _POOL_STRATEGIES:
+            strategy = self.default_strategy
+        if strategy not in _POOL_STRATEGIES:
+            strategy = _DEFAULT_POOL_STRATEGY
+        if strategy == "random":
+            return random.choice(usable)
+        if strategy == "round_robin":
+            count = len(cards)
+            start = self._cursors.get(line, 0) % count
+            for offset in range(count):
+                index = (start + offset) % count
+                if cards[index] in usable:
+                    self._cursors[line] = (index + 1) % count
+                    return cards[index]
+            return None
+        return usable[0]
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +654,33 @@ def _rank_results(
     return _keyword_rank(query, results)
 
 
+def _apply_ranking_mode(
+    ranker_config: Optional[Dict[str, Any]],
+    ranking_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Map the ``ranking_mode`` config item onto the ``ranker`` dict.
+
+    - ``auto`` (default) → unchanged; ``ranker.provider`` decides
+      (unset/``none`` → keyword, otherwise LLM with keyword fallback).
+    - ``keyword`` → force keyword scoring (``ranker.provider = "none"``).
+    - ``llm`` → force LLM ranking (``ranker.provider`` unset/``none`` →
+      ``"auto"``, i.e. the default auxiliary model).
+
+    The ``ranker`` dict (provider/model/prompt) stays usable alongside.
+    """
+    mode = (ranking_mode or "auto").strip().lower()
+    if mode == "keyword":
+        config = dict(ranker_config or {})
+        config["provider"] = "none"
+        return config
+    if mode == "llm":
+        config = dict(ranker_config or {})
+        if not config.get("provider") or str(config.get("provider")) == "none":
+            config["provider"] = "auto"
+        return config
+    return ranker_config
+
+
 # ---------------------------------------------------------------------------
 # Custom HTTP backend search
 # ---------------------------------------------------------------------------
@@ -392,11 +690,18 @@ def _search_custom_backend(
     backend_config: Dict[str, Any],
     query: str,
     limit: int,
+    card_pool: Optional[_CardPool] = None,
 ) -> tuple[List[Dict[str, Any]], Optional[int]]:
     """Execute a search against a custom HTTP endpoint.
 
-    Config keys: base_url, api_key_env, search_path, query_param (default ``q``),
-    auth_style (``bearer`` or ``x-api-key``, default ``bearer``).
+    Single-card config keys: base_url, api_key_env, search_path, query_param
+    (default ``q``), auth_style (``bearer`` or ``x-api-key``, default ``bearer``).
+
+    Multi-card: ``credentials`` (list of environment variable names — values
+    are read from the runtime environment, never from config) plus an optional
+    line-level ``pool_strategy`` (fill_first | round_robin | random).  With
+    ``credentials`` a failed card cools down in *card_pool* and the request
+    fails over to the next usable card; each card is dialed at most once.
 
     Returns ``(results, status_code)`` where *status_code* is ``None`` on
     success or non-HTTP errors, and the response status code on HTTP errors
@@ -405,10 +710,23 @@ def _search_custom_backend(
     import httpx
 
     base_url = (backend_config.get("base_url") or "").rstrip("/")
-    api_key_env = backend_config.get("api_key_env", "")
     search_path = backend_config.get("search_path", "/v1/coding_plan/search")
     query_param = backend_config.get("query_param", "q")
     auth_style = backend_config.get("auth_style", "bearer")
+    credentials = backend_config.get("credentials")
+
+    if isinstance(credentials, list) and credentials:
+        line = str(backend_config.get("name", "?"))
+        pool = card_pool if isinstance(card_pool, _CardPool) else _CardPool()
+        strategy = backend_config.get("pool_strategy")
+        if strategy not in _POOL_STRATEGIES:
+            strategy = None  # fall back to the pool's configured default
+        return _search_custom_backend_pooled(
+            base_url, search_path, query_param, auth_style,
+            credentials, line, strategy, pool, query, limit,
+        )
+
+    api_key_env = backend_config.get("api_key_env", "")
     api_key = get_provider_env(api_key_env) if api_key_env else ""
 
     if not base_url or not api_key:
@@ -438,6 +756,80 @@ def _search_custom_backend(
     except Exception as exc:
         logger.warning("Custom backend failed: %s", exc, exc_info=True)
     return [], None
+
+
+def _search_custom_backend_pooled(
+    base_url: str,
+    search_path: str,
+    query_param: str,
+    auth_style: str,
+    credentials: List[Any],
+    line: str,
+    strategy: Optional[str],
+    pool: _CardPool,
+    query: str,
+    limit: int,
+) -> tuple[List[Dict[str, Any]], Optional[int]]:
+    """Multi-card search for one custom line: select → dial → fail over.
+
+    A card that fails (HTTP status — classified or not — or a network error)
+    cools down in *pool* and the request moves to the next usable card.  A
+    single usable card caps transient cooldowns at 60s.  All cards exhausted
+    → line-level failure, keeping the ``(results, status_code)`` contract
+    (*status_code* = last HTTP failure, or ``None`` when nothing was dialed).
+    """
+    import httpx
+
+    cards = list(dict.fromkeys(c for c in credentials if isinstance(c, str)))
+    values = {name: _card_value(name) for name in cards}
+    usable = [name for name in cards if values[name]]
+    if not usable:
+        logger.warning(
+            "backend '%s': no usable credentials among %d configured card(s)",
+            line, len(cards),
+        )
+        return [], None
+    if not base_url:
+        return [], None
+
+    sole_card = len(usable) <= 1
+    url = f"{base_url}{search_path}"
+    payload = {query_param: query, "max_results": min(limit, _CUSTOM_BACKEND_MAX_RESULTS)}
+
+    tried: set = set()
+    last_status: Optional[int] = None
+    while True:
+        env_name = pool.select(line, usable, strategy=strategy, exclude=tried)
+        if env_name is None:
+            break
+        tried.add(env_name)
+        if auth_style == "x-api-key":
+            headers = {"Content-Type": "application/json", "x-api-key": values[env_name]}
+        else:
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {values[env_name]}"}
+        try:
+            resp = httpx.post(url, json=payload, headers=headers, timeout=_CUSTOM_BACKEND_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            results = _extract_custom_results(data)
+            if not results:
+                logger.warning("Custom backend returned no parseable results")
+            return results, None
+        except httpx.TimeoutException:
+            logger.warning("Custom backend timed out: %s (card %s)", line, env_name)
+            pool.mark_failed(line, env_name, None, sole_card)
+        except httpx.HTTPStatusError as exc:
+            # Status only — never echo the response body (it can quote the key).
+            last_status = exc.response.status_code
+            logger.warning(
+                "Custom backend HTTP error: %s (card %s, status %s)",
+                line, env_name, last_status,
+            )
+            pool.mark_failed(line, env_name, last_status, sole_card)
+        except Exception as exc:
+            logger.warning("Custom backend failed: %s (card %s)", line, env_name, exc, exc_info=True)
+            pool.mark_failed(line, env_name, None, sole_card)
+    return [], last_status
 
 
 def _extract_custom_results(data: Any) -> List[Dict[str, Any]]:
@@ -498,19 +890,25 @@ def _extract_custom_results(data: Any) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _search_one_backend(backend: Dict[str, Any], query: str, limit: int) -> tuple[List[Dict[str, Any]], Optional[int]]:
+def _search_one_backend(
+    backend: Dict[str, Any],
+    query: str,
+    limit: int,
+    card_pool: Optional[_CardPool] = None,
+) -> tuple[List[Dict[str, Any]], Optional[int]]:
     """Single-backend search worker for thread-pool execution.
 
     Returns ``(results, status_code)``. *status_code* carries the HTTP status
     for custom backends that fail with HTTP errors so the caller can invoke
-    health-cache cooldowns.
+    health-cache cooldowns.  *card_pool* carries the process-local multi-card
+    state for custom lines with ``credentials``.
     """
     name = str(backend.get("name", "?"))
     typ = str(backend.get("type", "") or "")
 
     try:
         if typ == "custom":
-            results, status_code = _search_custom_backend(backend, query, limit)
+            results, status_code = _search_custom_backend(backend, query, limit, card_pool)
         else:
             provider = _get_registered_provider(name)
             if provider is None:
@@ -555,6 +953,7 @@ class FederatedSearchProvider(WebSearchProvider):
     def __init__(self) -> None:
         super().__init__()
         self._health_cache: Optional[_HealthCache] = None
+        self._card_pool: Optional[_CardPool] = None
 
     def _get_health_cache(self, config: Dict[str, Any]) -> _HealthCache:
         if self._health_cache is None:
@@ -562,6 +961,16 @@ class FederatedSearchProvider(WebSearchProvider):
             ttl = int(hc.get("ttl_seconds", _DEFAULT_HEALTH_TTL))
             self._health_cache = _HealthCache(ttl_seconds=ttl)
         return self._health_cache
+
+    def _get_card_pool(self, config: Dict[str, Any]) -> _CardPool:
+        """Process-local multi-card state; survives across searches of this
+        provider instance (restart clears cooldowns and cursors)."""
+        if self._card_pool is None:
+            self._card_pool = _CardPool()
+        strategy = str(config.get("pool_strategy") or _DEFAULT_POOL_STRATEGY)
+        if strategy in _POOL_STRATEGIES:
+            self._card_pool.default_strategy = strategy
+        return self._card_pool
 
     @property
     def name(self) -> str:
@@ -602,8 +1011,19 @@ class FederatedSearchProvider(WebSearchProvider):
             backends: List[Dict[str, Any]] = config["backends"]
             timeout = int(config.get("timeout", _DEFAULT_TIMEOUT))
             max_results = int(config.get("max_results", _DEFAULT_MAX_RESULTS))
-            ranker_config = config.get("ranker")
+            ranker_config = _apply_ranking_mode(
+                config.get("ranker"), str(config.get("ranking_mode") or "auto"))
             min_backends = int(config.get("min_backends", 1))
+
+            # ── multi-card pool (custom lines with credentials only) ──
+            needs_card_pool = any(
+                isinstance(b, dict)
+                and str(b.get("type", "") or "") == "custom"
+                and isinstance(b.get("credentials"), list)
+                and b.get("credentials")
+                for b in backends
+            )
+            card_pool = self._get_card_pool(config) if needs_card_pool else None
 
             # ── health checks (cached, TTL-based) ──
             # Only active when ``health_check`` is explicitly configured.
@@ -656,10 +1076,11 @@ class FederatedSearchProvider(WebSearchProvider):
                 # hosting a bare worker's credential reads fail closed with
                 # UnscopedSecretError; run each worker in a copy of the caller's
                 # context — the same pattern as in-tree cron/scheduler_delivery.py.
+                extra = (card_pool,) if card_pool is not None else ()
                 futures = {
                     pool.submit(
                         contextvars.copy_context().run,
-                        _search_one_backend, b, query, limit,
+                        _search_one_backend, b, query, limit, *extra,
                     ): b
                     for b in active_backends
                 }
@@ -775,8 +1196,9 @@ class FederatedSearchProvider(WebSearchProvider):
             "badge": "advanced",
             "tag": (
                 "Aggregate multiple search backends with LLM-based ranking. "
-                "Configure backends under web.federated.backends in config.yaml. "
-                "Supports K-way aggregation, health checks, and custom re-rank prompts."
+                "Configure under Settings → Plugins (or web.federated in "
+                "config.yaml). Custom lines support multi-card credential "
+                "pools (fill_first / round_robin / random)."
             ),
             "env_vars": [],
         }

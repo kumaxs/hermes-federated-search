@@ -21,14 +21,32 @@ tool chain are required.
 - **Zero tool changes.** The `web_search` tool passes results through the same
   pipeline; the provider boundary is transparent to the agent.
 
+## What's New in Phase 2
+
+Two additions on top of v1.0.0 (branch `feat/p2-config-multicard`):
+
+- **Settings-page exposure.** The plugin declares six keys (`backends`,
+  `timeout`, `max_results`, `min_backends`, `ranking_mode`, `pool_strategy`)
+  through the official `config_schema` mechanism (manifest v2), so
+  Settings → Plugins renders an editable form and saves them under
+  `plugins.entries.hermes-federated-search.settings`. Values merge per
+  top-level key with the legacy `web.federated` block (settings win) — no
+  migration required.
+- **Multi-card credential pools.** A `custom` line can list several
+  environment variable names under `credentials` and rotate them with
+  `fill_first` / `round_robin` / `random`; a failing card cools down and the
+  request fails over to the next usable card. Key values stay in the runtime
+  environment — only names ever go into configuration.
+
 ## Install & Enable
 
 The plugin is a plain directory plugin (no Python packaging step). Install it
 into a Hermes home/profile and enable it:
 
 ```sh
-# from GitHub (recommended)
-hermes plugins install kumaxs/hermes-federated-search
+# from GitHub (recommended) — enables the plugin in the same step
+hermes plugins install kumaxs/hermes-federated-search --enable
+# ... or, for an already installed plugin:
 hermes plugins enable hermes-federated-search
 ```
 
@@ -39,18 +57,43 @@ Or copy/symlink this directory into the plugin directory yourself:
 
 **Activation semantics (opt-in user plugin):**
 
-- Like any user plugin, it is loaded when the gateway starts — after
-  enabling/disabling, restart the gateway and start a new session so the tool
-  surface and provider registry see the plugin.
-- `web.search_backend` and `web.federated` are read on each search call —
-  config edits take effect without a restart.
+- With a running gateway, `hermes plugins install … --enable` asks it to
+  reload plugins live — measured message: `Gateway reloaded plugins; nothing
+  of this plugin needs a session or restart.` No gateway restart is
+  required.
+- If the gateway is not running, or reports `reloaded=false` (older builds),
+  start/restart it and open a new session so the provider registry sees the
+  plugin.
+- `web.search_backend`, `web.federated` and
+  `plugins.entries.hermes-federated-search.settings` are read on each search
+  call — config edits (including settings-page saves) take effect without a
+  restart.
+
+**After enabling — expected signals:**
+
+- `hermes plugins show hermes-federated-search` → `Status: enabled`.
+- Config readback (`grep -n federated <profile>/config.yaml`):
+  `search_backend: federated` plus the `federated:` block — or the
+  `plugins.entries.hermes-federated-search.settings` tree when the keys were
+  saved from the settings page.
+- Gateway log lines: `Plugin 'hermes-federated-search' registered web
+  provider: federated`, and per-query
+  `Federated search: '<query>' (N/M backends active, …)`.
+- A fresh search succeeds through the `federated` provider (`success=true`,
+  at least one result).
+- Desktop (phase 2): Settings → Plugins → hermes-federated-search shows the
+  six-key form — `backends` as a JSON editor, number fields for `timeout` /
+  `max_results` / `min_backends`, and the `ranking_mode` / `pool_strategy`
+  dropdowns; reopening the form shows saved values.
 
 **Disable / roll back:**
 
 - Point `web.search_backend` back at your previous backend (e.g. `tavily`), or
   remove the key — takes effect on the next search call.
-- Fully remove: `hermes plugins disable hermes-federated-search` (restart the
-  gateway) and delete the plugin directory.
+- Fully remove: `hermes plugins remove hermes-federated-search` — add
+  `--allow-live-gateway` when the gateway keeps running (a guard blocks
+  removal otherwise; measured to deregister the provider live, no restart
+  needed).
 
 Requirements: `httpx` (present in Hermes environments). Config reading uses
 `hermes_yaml` when available (Hermes checkouts) and falls back to PyYAML.
@@ -78,7 +121,22 @@ results.
 
 ## Configuration Reference
 
-All federated configuration lives under `web.federated` in `config.yaml`.
+Federated configuration can be written in two places; they merge per
+top-level key, with the official settings tree winning:
+
+- **Settings → Plugins** (official form). Values are stored under
+  `plugins.entries.hermes-federated-search.settings` in `config.yaml`. The
+  six keys declared by the plugin (`plugin.yaml` `config_schema`):
+  `backends`, `timeout`, `max_results`, `min_backends`, `ranking_mode`,
+  `pool_strategy`.
+- **`web.federated`** in `config.yaml` — the legacy location, still fully
+  supported; no migration is required.
+
+Notes: the settings form does not shadow legacy values by itself — the old
+`web.federated` values keep applying until the matching key is saved on the
+settings page. `web.federated` is an unrecognized nested path for
+`hermes config set` (needs `--force`) and never appears in the desktop form;
+use the settings page (or edit `config.yaml` directly) instead.
 
 ### Top-level Options
 
@@ -88,6 +146,8 @@ All federated configuration lives under `web.federated` in `config.yaml`.
 | `max_results` | int | `8` | Maximum number of results returned after ranking (ceiling). The caller's `limit` parameter is still respected — the actual output count is `min(limit, max_results)`. |
 | `k` | int | len(backends) | **K-way aggregation.** Must equal the number of configured backends. When explicitly set, the plugin validates `len(backends) == k`. Maximum 32. |
 | `min_backends` | int | `1` | Minimum number of backends that must succeed for the search to be considered successful. Must satisfy `1 ≤ min_backends ≤ k`. |
+| `ranking_mode` | str | `auto` | Ranking mode: `auto` (follows `ranker.provider` as before), `keyword` (force keyword scoring), `llm` (force LLM ranking; uses the default auxiliary model when `ranker.provider` is unset). The `ranker` dict stays usable alongside. |
+| `pool_strategy` | str | `fill_first` | Multi-card rotation for custom lines with `credentials`: `fill_first` (use one card until it fails), `round_robin` (rotate per request), `random`. Overridable per line. |
 | `ranker` | dict | — | Optional LLM ranking configuration (see below). |
 | `health_check` | dict | — | Optional cached health probing (see below). When absent, all backends are dispatched directly (backward compatible). |
 | `backends` | list | — | **Required.** List of sub-backend configurations. |
@@ -155,7 +215,9 @@ backends:
 | `name` | str | ✅ | — | Display name for logging and error messages. |
 | `type` | str | ✅ | — | Must be `"custom"` to enable custom HTTP mode. |
 | `base_url` | str | ✅ | — | Base URL of the search API (e.g., `https://api.minimaxi.com`). |
-| `api_key_env` | str | ✅ | — | Environment variable that holds the API key (e.g., `MINIMAX_CN_API_KEY`). Set in `.env`. |
+| `api_key_env` | str | — | — | Single-card mode: environment variable that holds the API key (e.g., `MINIMAX_CN_API_KEY`). Set in `.env`. Use `credentials` instead for a multi-card pool. |
+| `credentials` | list | — | — | Multi-card pool: list of environment variable **names** (e.g., `[MINIMAX_KEY_1, MINIMAX_KEY_2]`). Values live in the runtime environment, never in `config.yaml`. A failed card cools down and the line fails over to the next usable card. |
+| `pool_strategy` | str | — | inherited | Per-line override of the top-level `pool_strategy` (validate: `fill_first` \| `round_robin` \| `random`). |
 | `search_path` | str | — | `"/v1/coding_plan/search"` | API path appended to `base_url`. |
 | `query_param` | str | — | `"q"` | Query string parameter name. |
 | `auth_style` | str | — | `"bearer"` | Authentication style: `"bearer"` (Authorization header) or `"x-api-key"` (x-api-key header). |
@@ -167,6 +229,58 @@ API response formats:
 - `{"organic": [{"title", "link", "snippet"}, ...]}`
 - `{"data": {"web": [{"title", "url", "description"}, ...]}}`
 - `{"results": [{"title", "url", "content"}, ...]}`
+
+#### Multi-Card Credential Pools (`credentials`)
+
+Give one custom line several keys of the same vendor; a failing card is
+cooled down and the request fails over to the next usable card:
+
+```yaml
+backends:
+  - name: minimax
+    type: custom
+    base_url: "https://api.minimaxi.com"
+    search_path: /v1/coding_plan/search
+    query_param: "q"
+    credentials: [MINIMAX_KEY_1, MINIMAX_KEY_2]   # env var NAMES only
+    pool_strategy: round_robin                    # optional, per-line
+```
+
+Rules and semantics:
+
+- **Names only.** `credentials` items must match
+  `^[A-Z][A-Z0-9_]{0,127}$`. Values are resolved from the runtime
+  environment (per-profile `.env`); a pasted key value is rejected at
+  validation with a "looks like a secret value" error, and error messages
+  never echo the item. Duplicate names are deduplicated (warned).
+- **Value shapes.** Empty / whitespace-only values and values containing a
+  line break are skipped as not configured; a card whose env var is missing
+  is never dialed. If no card on the line is usable, the line fails without
+  network traffic.
+- **Strategies.** `fill_first` (default) uses the first usable card and only
+  switches when it fails; `round_robin` rotates one card per request
+  (process-local cursor); `random` picks uniformly among the usable cards.
+- **Switching.** A card that fails — HTTP error (401/403/429/5xx) or a
+  network/timeout error — is cooled down and the request continues with the
+  next usable card. Each card is dialed at most once per request. When every
+  card is exhausted, the line fails as a whole (same
+  `(results, status_code)` contract as single-card lines).
+- **Cooldowns** (aligned with the Hermes credential pool): 401 → 300s,
+  403 → 300s, 429 → 3600s, anything else (5xx / network / unknown) → 300s;
+  `401/403/429` keep their values. When the line has a single usable card,
+  *transient* cooldowns are capped at 60s (host `sole_credential`
+  alignment). The legacy `api_key_env` single-card path is **not** capped.
+- **State is process-local.** Cooldowns and the round-robin cursor live in
+  memory; restarting Hermes clears them.
+- **Registered providers cannot be pooled.** The host resolves a registered
+  provider's key internally (`search(query, limit)` takes no key parameter),
+  so a `credentials` list on a non-`custom` line is ignored with a warning
+  and the line keeps working exactly as before. Multi-card requires
+  `type: custom`.
+- **Tavily as a custom line** (migration path for pooling a registered
+  provider): `base_url: "https://api.tavily.com"`, `search_path: /search`,
+  `query_param: query`, `auth_style: bearer` — its
+  `{"results": [{title, url, content}, ...]}` response is already supported.
 
 ### Health Checks (`health_check`)
 
@@ -265,10 +379,15 @@ web:
 | `k=N but M backend(s) configured` | The `k` value doesn't match the number of `backends` entries. Either adjust `k` or add/remove backends. |
 | `Custom backend timed out` | The configured API didn't respond within 15s. Verify the `base_url` and `search_path` are correct. |
 | `LLM ranking failed, falling back to keyword ranking` | Normal fallback — the ranking LLM was unavailable. Results use keyword scoring instead. |
+| `credentials[N] is not a valid environment variable name` / `looks like a secret value` | Fix the `credentials` list: it takes environment variable **names** only (uppercase, digits, underscores). Put the key value in the runtime environment (`.env`), never in `config.yaml`. |
+| `no usable credentials among N configured card(s)` | Every listed env var is missing, empty or multi-line. Set the values in the profile `.env`; missing-card names are logged as they are skipped. |
+| `pool_strategy must be one of: ...` / `ranking_mode must be one of: ...` | Invalid enum value in `web.federated` (the settings page dropdown only offers legal values). |
 
-Note: the provider reads raw YAML for `web.federated` (the standard config
-loader strips unknown keys from the `web` section). Config changes therefore
-take effect on the next search call without a restart.
+Note: the provider reads raw YAML for `web.federated` and for
+`plugins.entries.hermes-federated-search.settings` (the standard config loader
+strips unknown keys from the `web` section). Config changes — including
+settings-page saves — therefore take effect on the next search call without a
+restart.
 
 ## Known Limitations
 
@@ -284,20 +403,34 @@ take effect on the next search call without a restart.
   Enable `health_check` to avoid waiting on dead backends.
 - **Custom ranking prompt requires LLM ranking.** The `ranker.prompt` field is
   only used when a real provider (not `"none"`) is configured for ranking.
+- **Registered providers stay single-card.** Multi-card pooling needs
+  `type: custom` — the host's provider interface takes no key parameter, so a
+  `credentials` list on a registered line is ignored (with a warning). The
+  `k` option also stays out of the settings form (its existing validation is
+  unchanged).
+- **Pool cooldowns are in-process.** Restarting Hermes clears cooldowns and
+  the round-robin cursor.
 
-## Status (v1.0.0)
+## Status
 
-First release — the original federated-search feature set, packaged as a
-standalone plugin:
+v1.0.0 base plus the phase-2 improvements:
 
-- **Included:** parallel aggregation with `k` / `min_backends` / `required`
-  semantics; timeout with partial results; keyword ranking plus optional LLM
-  re-ranking with a custom prompt; custom HTTP backends (three response
-  shapes); cached health checks with failure cooldowns; per-backend
+- **Included (v1.0.0):** parallel aggregation with `k` / `min_backends` /
+  `required` semantics; timeout with partial results; keyword ranking plus
+  optional LLM re-ranking with a custom prompt; custom HTTP backends (three
+  response shapes); cached health checks with failure cooldowns; per-backend
   configuration.
-- **Not included:** multi-key credential rotation (credential pool) — planned
-  separately; per-backend `timeout` / `weight` / `result_limit` — intentionally
-  not implemented.
+- **Included (phase 2, branch `feat/p2-config-multicard`):** official
+  Settings → Plugins exposure of six config keys (`plugin.yaml`
+  `config_schema`: `backends`, `timeout`, `max_results`, `min_backends`,
+  `ranking_mode`, `pool_strategy`; merged with legacy `web.federated`);
+  per-line multi-card credential pools (`fill_first` / `round_robin` /
+  `random`) with automatic failover and pool-aligned cooldowns;
+  `ranking_mode` (auto | keyword | llm).
+- **Not included:** multi-card on registered providers (host interface takes
+  no key) and direct credential-pool (`auth.json`) consumption — future
+  increments; per-backend `timeout` / `weight` / `result_limit` —
+  intentionally not implemented.
 
 ## Development
 

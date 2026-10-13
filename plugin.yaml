@@ -1,6 +1,7 @@
 name: hermes-federated-search
 version: 1.0.0
-description: "Federated search — aggregate results from multiple search backends (Tavily, SearXNG, custom HTTP endpoints, etc.) with optional LLM-based relevance ranking. Configure sub-backends under web.federated.backends."
+manifest_version: 2
+description: "Federated search — aggregate results from multiple search backends (Tavily, SearXNG, custom HTTP endpoints, etc.) with optional LLM-based relevance ranking and per-line multi-card credential pools. Configure via Settings → Plugins or web.federated in config.yaml."
 author: kumaxs
 license: MIT
 homepage: https://github.com/kumaxs/hermes-federated-search
@@ -12,3 +13,36 @@ tags:
 kind: backend
 provides_web_providers:
   - federated
+config_schema:
+  backends:
+    type: list
+    default: []
+    label: 线路列表
+    description: "数组，元素为主机配置对象（name / type / base_url / api_key_env / credentials / required 等）"
+  timeout:
+    type: int
+    default: 10
+    label: 超时（秒）
+    description: "等待全部线路返回的总超时；到期返回已完成线路的部分结果"
+  max_results:
+    type: int
+    default: 8
+    label: 输出条数
+    description: "排序后返回的最大条数（实际输出 = min(limit, max_results)）"
+  min_backends:
+    type: int
+    default: 1
+    label: 最少成功线路
+    description: "至少 N 条线路成功才算搜索成功（1 ≤ N ≤ 线路数）"
+  ranking_mode:
+    type: str
+    choices: [auto, keyword, llm]
+    default: auto
+    label: 排序方式
+    description: "auto=按 ranker 配置；keyword=强制关键词；llm=强制 LLM 排序"
+  pool_strategy:
+    type: str
+    choices: [fill_first, round_robin, random]
+    default: fill_first
+    label: 多卡使用策略
+    description: "自定义线路凭据池（credentials 列表）的轮换策略"
