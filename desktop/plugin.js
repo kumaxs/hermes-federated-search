@@ -27,7 +27,7 @@
  * register(ctx), not from an import.
  */
 
-import { Badge, Button, Checkbox, ConfirmDialog, EmptyState, ErrorState, host, Input, Loader, ScrollArea, SegmentedControl, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea, Tip } from "@hermes/plugin-sdk";
+import { Button, Checkbox, ConfirmDialog, Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, EmptyState, ErrorState, host, Input, Loader, ScrollArea, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea, Tip } from "@hermes/plugin-sdk";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { jsx, jsxs } from "react/jsx-runtime";
 
@@ -37,10 +37,18 @@ const PLUGIN_KEY = "hermes-federated-search";
 // loads the widget from the CLIENT machine while the gateway runs the agent
 // half, so the two halves can genuinely be different builds.
 // `tests/test_desktop_widget.py` fails the build when they drift.
-const WIDGET_VERSION = "1.0.0";
+const WIDGET_VERSION = "1.1.0";
 
 const CONFIG_HINT =
 	"凭据只录环境变量名；值请在 Settings → Keys 录入（PUT /api/env），不要写进 config.yaml。";
+
+// The 指引 dialog body — one source of truth for the three landing spots
+// (docs/agent-config.md, this dialog, README §期望信号). The first line names
+// the enable path verbatim so walkthrough greps stay stable.
+const GUIDE_OPEN_UI =
+	"桌面 Hermes → 设置 → 技能与工具 → 插件 → 打开 hermes-federated-search（带 .hermes-package.json 的统一包，桌面半默认不启用）→ 设置 → 插件 →「聚合搜索」。条目未出现：⌘K →「Reload desktop plugins」。";
+const GUIDE_ADD_PROVIDER =
+	"①卡片页「＋ 添加线路」；②填 name 与 base_url（可选 search_path/query_param/auth_style）；③Key 字段填环境变量名（^[A-Z][A-Z0-9_]{0,127}$，如 TAVILY_API_KEY；多 Key 一行一个）；密钥值走 设置 → Keys（写同名变量）。";
 
 const OPTION_KEYS = ["min_backends", "ranking_mode", "pool_strategy", "timeout", "max_results"];
 const DEFAULT_OPTIONS = {
@@ -52,6 +60,10 @@ const DEFAULT_OPTIONS = {
 };
 const RANKING_MODES = ["auto", "keyword", "llm"];
 const POOL_STRATEGIES = ["fill_first", "round_robin", "random"];
+// Radix selects cannot carry an empty-string item; these sentinels map to
+// "write nothing" (per-line 跟随全局) and "unset" (ranker provider/model).
+const POOL_INHERIT = "__inherit__";
+const RANKER_UNSET = "__unset__";
 const CUSTOM_FIELDS = [
 	{ key: "base_url", label: "base_url", placeholder: "https://example.invalid/search" },
 	{ key: "search_path", label: "search_path", placeholder: "/search" },
@@ -74,26 +86,83 @@ function asInt(value, fallback) {
 
 const owns = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 
+function emptyRanker() {
+	return { present: false, broken: false, tree: {}, provider: "", model: "" };
+}
+
 function emptyDraft() {
 	return {
 		backends: [],
 		explicitK: null,
 		legacyK: null,
-		options: { ...DEFAULT_OPTIONS }
+		options: { ...DEFAULT_OPTIONS },
+		ranker: emptyRanker()
 	};
 }
 
+const isPlainObject = (value) =>
+	!!value && typeof value === "object" && !Array.isArray(value);
+
+/** Ranker read: settings.ranker wins (the provider's merge is per top-level
+ *  key), legacy `web.federated.ranker` is the fallback. A non-object node is
+ *  reported as a problem and the write path stays away from it. */
+function readRanker(settingsRanker, legacyRanker) {
+	const ranker = emptyRanker();
+	const problems = [];
+	let source = null;
+	let label = null;
+	if (settingsRanker != null) {
+		source = settingsRanker;
+		label = "settings.ranker";
+	} else if (legacyRanker != null) {
+		source = legacyRanker;
+		label = "web.federated.ranker";
+	}
+	if (source != null) {
+		if (isPlainObject(source)) {
+			ranker.present = true;
+			ranker.tree = { ...source };
+			ranker.provider = asText(source.provider);
+			ranker.model = asText(source.model);
+		} else {
+			ranker.broken = true;
+			problems.push(`${label} 不是对象——已按只读处理，不会覆盖原值。`);
+		}
+	}
+	return { ranker, problems };
+}
+
+/** Ranker write: whole-tree merge (prompt and unknown keys stay), provider /
+ *  model leaves replaced — a cleared select deletes its leaf. The key is
+ *  omitted when nothing existed and nothing was chosen (no automatic write),
+ *  and stays untouched when the read tree was not an object. */
+function rankerFromDraft(ranker) {
+	if (!ranker || ranker.broken) return undefined;
+	const tree = { ...(ranker.tree || {}) };
+	delete tree.provider;
+	delete tree.model;
+	const provider = asText(ranker.provider).trim();
+	const model = asText(ranker.model).trim();
+	if (provider) tree.provider = provider;
+	if (model) tree.model = model;
+	if (!ranker.present && !provider && !model) return undefined;
+	return tree;
+}
+
 /** One settings-tree line → one draft line. `raw` keeps extension keys
- *  (api_key_env, required, per-line pool_strategy, …) so an edit in the UI
- *  never drops a key this page does not render. */
+ *  (api_key_env, required, unknown keys, …) so an edit in the UI never drops
+ *  a key this page does not render. `type` keeps the source verbatim —
+ *  missing stays missing (registered semantics in provider.py); the page no
+ *  longer injects "custom". */
 function lineFromValue(source) {
 	const raw = source && typeof source === "object" && !Array.isArray(source) ? { ...source } : {};
 	const line = {
 		name: asText(raw.name),
-		type: asText(raw.type) || "custom",
+		type: asText(raw.type),
 		credentials: Array.isArray(raw.credentials)
 			? raw.credentials.filter((item) => typeof item === "string")
 			: [],
+		pool_strategy: asText(raw.pool_strategy),
 		raw
 	};
 	for (const field of CUSTOM_FIELDS) line[field.key] = asText(raw[field.key]);
@@ -101,13 +170,16 @@ function lineFromValue(source) {
 }
 
 /** Draft line → settings-tree line. Unknown keys round-trip unchanged; known
- *  keys are only emitted when non-empty or already present in the source. */
+ *  keys are only emitted when non-empty or already present in the source.
+ *  Per-line `pool_strategy`: a chosen strategy writes; emptying the select
+ *  (跟随全局) deletes the key; a legacy empty string left untouched
+ *  round-trips as-is. */
 function lineToValue(line) {
 	const raw = line.raw && typeof line.raw === "object" ? line.raw : {};
 	const out = { name: line.name };
 	if (line.type) out.type = line.type;
 	for (const [key, value] of Object.entries(raw)) {
-		if (key === "name" || key === "type" || key === "credentials") continue;
+		if (key === "name" || key === "type" || key === "credentials" || key === "pool_strategy") continue;
 		if (CUSTOM_FIELDS.some((field) => field.key === key)) continue;
 		out[key] = value;
 	}
@@ -115,6 +187,10 @@ function lineToValue(line) {
 		const value = asText(line[field.key]);
 		if (value !== "" || owns(raw, field.key)) out[field.key] = value;
 	}
+	const poolRaw = owns(raw, "pool_strategy") ? asText(raw.pool_strategy) : null;
+	const pool = asText(line.pool_strategy);
+	if (pool !== "") out.pool_strategy = pool;
+	else if (poolRaw === "") out.pool_strategy = "";
 	if (line.credentials.length > 0 || owns(raw, "credentials")) {
 		out.credentials = [...line.credentials];
 	}
@@ -122,9 +198,11 @@ function lineToValue(line) {
 }
 
 /** Settings-tree values ({key: value} as `plugins.manage list` reports them)
- *  → draft. Tolerant: a damaged tree yields problems, never a crash, and the
- *  caller keeps the raw text read-only instead of overwriting it. */
-function draftFromValues(values) {
+ *  → draft. `extras` carries the raw-config reads (settings.ranker /
+ *  web.federated.ranker) that `plugins.manage list` cannot distinguish from a
+ *  schema default. Tolerant: a damaged tree yields problems, never a crash,
+ *  and the caller keeps the raw text read-only instead of overwriting it. */
+function draftFromValues(values, extras) {
 	const draft = emptyDraft();
 	const problems = [];
 	const source = values && typeof values === "object" && !Array.isArray(values) ? values : {};
@@ -157,17 +235,24 @@ function draftFromValues(values) {
 		draft.options.pool_strategy = DEFAULT_OPTIONS.pool_strategy;
 		problems.push("pool_strategy 不在可选值内——已回退到默认 fill_first。");
 	}
+	const rankerLoaded = readRanker(
+		extras ? extras.settingsRanker ?? null : source.ranker ?? null,
+		extras ? extras.legacyRanker ?? null : null
+	);
+	draft.ranker = rankerLoaded.ranker;
+	problems.push(...rankerLoaded.problems);
 	draft.explicitK = typeof source.k === "number" && Number.isFinite(source.k) ? source.k : null;
 	return { draft, problems };
 }
 
 /** Draft → the values payload written through `plugins.manage settings`.
  *  Only config_schema keys, `k` is never written (absent k = number of
- *  lines, which is what the UI always produces). */
+ *  lines, which is what the UI always produces); `ranker` is emitted only
+ *  when it exists or was explicitly configured. */
 function settingsFromDraft(draft) {
 	const ranking = asText(draft.options.ranking_mode);
 	const pool = asText(draft.options.pool_strategy);
-	return {
+	const payload = {
 		backends: draft.backends.map(lineToValue),
 		timeout: asInt(draft.options.timeout, DEFAULT_OPTIONS.timeout),
 		max_results: asInt(draft.options.max_results, DEFAULT_OPTIONS.max_results),
@@ -175,6 +260,9 @@ function settingsFromDraft(draft) {
 		ranking_mode: RANKING_MODES.includes(ranking) ? ranking : DEFAULT_OPTIONS.ranking_mode,
 		pool_strategy: POOL_STRATEGIES.includes(pool) ? pool : DEFAULT_OPTIONS.pool_strategy
 	};
+	const ranker = rankerFromDraft(draft.ranker);
+	if (ranker !== undefined) payload.ranker = ranker;
+	return payload;
 }
 
 /** Draft problems that must block a write (S4). Messages carry the item
@@ -220,7 +308,14 @@ function cloneDraft(draft) {
 		})),
 		explicitK: draft.explicitK ?? null,
 		legacyK: draft.legacyK ?? null,
-		options: { ...draft.options }
+		options: { ...draft.options },
+		ranker: {
+			present: !!(draft.ranker && draft.ranker.present),
+			broken: !!(draft.ranker && draft.ranker.broken),
+			tree: { ...((draft.ranker && draft.ranker.tree) || {}) },
+			provider: draft.ranker ? asText(draft.ranker.provider) : "",
+			model: draft.ranker ? asText(draft.ranker.model) : ""
+		}
 	};
 }
 
@@ -247,6 +342,12 @@ function updateLineField(draft, index, field, value) {
 function updateOption(draft, key, value) {
 	const next = cloneDraft(draft);
 	next.options[key] = value;
+	return next;
+}
+
+function updateRanker(draft, field, value) {
+	const next = cloneDraft(draft);
+	next.ranker[field] = value;
 	return next;
 }
 
@@ -344,7 +445,6 @@ function keyCardView(line, lineIndex, keyIndex, env, handlers) {
 }
 
 function lineCardView(line, index, handlers) {
-	const isCustom = line.type === "custom";
 	return jsxs(
 		"div",
 		{
@@ -359,10 +459,6 @@ function lineCardView(line, index, handlers) {
 						placeholder: "线路名（name）",
 						className: "max-w-56",
 						onChange: (event) => handlers.onField(index, "name", event.target.value)
-					}),
-					jsx(Badge, {
-						variant: isCustom ? "outline" : "secondary",
-						children: isCustom ? "custom" : "registered"
 					}),
 					jsxs("label", {
 						className: "ml-auto flex items-center gap-2 text-xs text-(--ui-text-secondary)",
@@ -386,45 +482,23 @@ function lineCardView(line, index, handlers) {
 			),
 			jsxs(
 				"div",
-				{ className: "flex items-center gap-2", children: [
-					jsx(SegmentedControl, {
-						value: line.type,
-						options: [
-							{ value: "custom", label: "custom" },
-							{ value: "registered", label: "registered" }
-						],
-						onValueChange: (value) => handlers.onType(index, value)
-					}),
-					jsx("span", {
-						className: "text-xs text-(--ui-text-tertiary)",
-						children: isCustom
-							? "自定义 HTTP 线路（可多 Key 轮换）"
-							: "主机已注册的 provider（凭据由主机解析，credentials 会被忽略）"
-					})
-				] },
-				`type-${index}`
-			),
-			isCustom
-				? jsxs(
-						"div",
-						{ className: "grid gap-2 sm:grid-cols-2", children: CUSTOM_FIELDS.map((field) =>
-							jsx(
-								"label",
-								{ className: "grid gap-1 text-xs text-(--ui-text-secondary)", children: [
-									field.label,
-									jsx(Input, {
-										value: line[field.key],
-										placeholder: field.placeholder,
-										"aria-label": field.label,
-										onChange: (event) => handlers.onField(index, field.key, event.target.value)
-									})
-								] },
-								`${line.name || index}-${field.key}`
-							)
-						) },
-						`fields-${index}`
+				{ className: "grid gap-2 sm:grid-cols-2", children: CUSTOM_FIELDS.map((field) =>
+					jsx(
+						"label",
+						{ className: "grid gap-1 text-xs text-(--ui-text-secondary)", children: [
+							field.label,
+							jsx(Input, {
+								value: line[field.key],
+								placeholder: field.placeholder,
+								"aria-label": field.label,
+								onChange: (event) => handlers.onField(index, field.key, event.target.value)
+							})
+						] },
+						`${line.name || index}-${field.key}`
 					)
-				: null,
+				) },
+				`fields-${index}`
+			),
 			jsxs(
 				"div",
 				{ className: "grid gap-2", children: [
@@ -449,7 +523,30 @@ function lineCardView(line, index, handlers) {
 						size: "sm",
 						onClick: () => handlers.onAddKey(index),
 						children: "＋ 添加 Key"
-					})
+					}),
+					jsxs("label", { className: "grid gap-1 text-xs text-(--ui-text-secondary)", children: [
+						"Key 轮换策略（pool_strategy）",
+						jsx(Select, {
+							value: line.pool_strategy ? line.pool_strategy : POOL_INHERIT,
+							onValueChange: (value) =>
+								handlers.onLinePool(index, value === POOL_INHERIT ? "" : value),
+							children: jsxs(SelectTrigger, { "aria-label": "pool_strategy", children: [
+								jsx(SelectValue, {}),
+								jsx(SelectContent, { children: [
+									jsx(SelectItem, { value: POOL_INHERIT, children: "跟随全局（不写键）" }, "pool-inherit"),
+									...POOL_STRATEGIES.map((policy) =>
+										jsx(SelectItem, { value: policy, children: policy }, `pool-${policy}`)
+									)
+								] })
+							] })
+						}),
+						line.pool_strategy && !POOL_STRATEGIES.includes(line.pool_strategy)
+							? jsx("span", {
+									className: "text-xs text-(--ui-text-tertiary)",
+									children: "当前值不在可选内（provider 校验会拒绝）；未改动则原样保留。"
+								})
+							: null
+					] }, `pool-${index}`)
 				] }
 			)
 		] },
@@ -457,7 +554,70 @@ function lineCardView(line, index, handlers) {
 	);
 }
 
-function optionsView(draft, handlers) {
+function rankerView(draft, catalog, handlers) {
+	const info = draft.ranker || emptyRanker();
+	if (draft.options.ranking_mode === "keyword") return null;
+	const providers = catalog && Array.isArray(catalog.providers) ? catalog.providers : [];
+	const phase = (catalog && catalog.phase) || "loading";
+	const selected = providers.find((item) => item.slug === info.provider) || null;
+	const models = selected && Array.isArray(selected.models) ? selected.models : [];
+	return jsxs(
+		"div",
+		{ className: "grid gap-2 rounded-md border border-(--ui-stroke-tertiary) p-2", children: [
+			jsx("div", { className: "text-xs text-(--ui-text-secondary)", children: "排序模型（ranker.model）" }),
+			phase === "error"
+				? warningBar(
+						"模型目录不可用（需更新桌面端）。ranker 键可在本页「从字符串导入」或 设置 → 技能与工具 → 插件 → hermes-federated-search → Agent settings 里直接改；密钥值走 Settings → Keys。"
+					)
+				: null,
+			info.broken
+				? warningBar("ranker 不是对象——已按只读处理，未改动不会覆盖原值。")
+				: null,
+			jsxs("div", { className: "grid gap-2 sm:grid-cols-2", children: [
+				jsx("label", { className: "grid gap-1 text-xs text-(--ui-text-secondary)", children: [
+					"排序 provider（ranker.provider）",
+					jsx(Select, {
+						value: info.provider ? info.provider : RANKER_UNSET,
+						onValueChange: (value) => handlers.onRankerProvider(value === RANKER_UNSET ? "" : value),
+						children: jsxs(SelectTrigger, { "aria-label": "ranker.provider", children: [
+							jsx(SelectValue, {}),
+							jsx(SelectContent, { children: [
+								jsx(SelectItem, { value: RANKER_UNSET, children: "未设置（llm 走默认辅助模型）" }, "ranker-provider-unset"),
+								...providers.map((item) =>
+									jsx(SelectItem, { value: item.slug, children: item.slug }, `ranker-provider-${item.slug}`)
+								)
+							] })
+						] })
+					})
+				] }),
+				jsx("label", { className: "grid gap-1 text-xs text-(--ui-text-secondary)", children: [
+					"排序模型（ranker.model）",
+					jsx(Select, {
+						value: info.model ? info.model : RANKER_UNSET,
+						onValueChange: (value) => handlers.onRankerModel(value === RANKER_UNSET ? "" : value),
+						children: jsxs(SelectTrigger, { "aria-label": "ranker.model", children: [
+							jsx(SelectValue, {}),
+							jsx(SelectContent, { children: [
+								jsx(SelectItem, { value: RANKER_UNSET, children: "未设置（跟随 provider 默认）" }, "ranker-model-unset"),
+								...models.map((name) =>
+									jsx(SelectItem, { value: name, children: name }, `ranker-model-${name}`)
+								)
+							] })
+						] })
+					})
+				] })
+			] }),
+			phase === "empty"
+				? jsx("div", { className: "text-xs text-(--ui-text-tertiary)", children: "未配置任何 provider——ranker 只读现值，未改动则原样保留。" })
+				: null,
+			!info.provider && draft.options.ranking_mode === "auto"
+				? jsx("div", { className: "text-xs text-(--ui-text-tertiary)", children: "未设置：auto 将走关键词；选择 provider 后写回 settings.ranker（prompt 等既有键保留）。" })
+				: null
+		] }
+	);
+}
+
+function optionsView(draft, catalog, handlers) {
 	return jsxs(
 		"div",
 		{ className: "grid gap-3 rounded-lg border border-(--ui-stroke-tertiary) p-3", children: [
@@ -469,7 +629,8 @@ function optionsView(draft, handlers) {
 						value: String(draft.options.min_backends),
 						"aria-label": "min_backends",
 						onChange: (event) => handlers.onOption("min_backends", event.target.value)
-					})
+					}),
+					jsx("span", { className: "text-xs text-(--ui-text-tertiary)", children: "本次「有结果返回」的线路数须 ≥N，不足则整次搜索失败；成功＝线路在时限内返回了有结果的响应。required 线路必须成功。" })
 				] }),
 				jsx("label", { className: "grid gap-1 text-xs text-(--ui-text-secondary)", children: [
 					"超时（秒，timeout）",
@@ -477,7 +638,8 @@ function optionsView(draft, handlers) {
 						value: String(draft.options.timeout),
 						"aria-label": "timeout",
 						onChange: (event) => handlers.onOption("timeout", event.target.value)
-					})
+					}),
+					jsx("span", { className: "text-xs text-(--ui-text-tertiary)", children: "超时（timeout）＝等全部线路返回的总时限；到期未返回的线路丢弃、已返回的线路凑部分结果。" })
 				] }),
 				jsx("label", { className: "grid gap-1 text-xs text-(--ui-text-secondary)", children: [
 					"输出条数（max_results）",
@@ -500,26 +662,19 @@ function optionsView(draft, handlers) {
 								jsx(SelectItem, { value: mode, children: mode }, `mode-${mode}`)
 							) })
 						] })
-					})
-				] }),
-				jsx("label", { className: "grid gap-1 text-xs text-(--ui-text-secondary)", children: [
-					"多卡使用策略（pool_strategy）",
-					jsx(Select, {
-						value: draft.options.pool_strategy,
-						onValueChange: (value) => handlers.onOption("pool_strategy", value),
-						children: jsxs(SelectTrigger, { "aria-label": "pool_strategy", children: [
-							jsx(SelectValue, {}),
-							jsx(SelectContent, { children: POOL_STRATEGIES.map((policy) =>
-								jsx(SelectItem, { value: policy, children: policy }, `pool-${policy}`)
-							) })
-						] })
-					})
+					}),
+					jsx("span", { className: "text-xs text-(--ui-text-tertiary)", children: "auto＝按 ranker 配置：未配置→关键词；配置→LLM＋失败回退关键词；keyword／llm 为强制模式。" })
 				] })
-			] })
+			] }),
+			rankerView(draft, catalog, handlers)
 		] });
 }
 
-function configStringView(draft) {
+function configStringView(draft, guide) {
+	const open = !!(guide && guide.open);
+	const onOpenChange = (next) => {
+		if (guide && typeof guide.setOpen === "function") guide.setOpen(next);
+	};
 	return jsxs(
 		"div",
 		{ className: "grid gap-2 rounded-lg border border-(--ui-stroke-tertiary) p-3", children: [
@@ -530,8 +685,26 @@ function configStringView(draft) {
 				}),
 				jsx(Tip, {
 					label: "docs/agent-config.md 是唯一权威入口：改哪棵树、键语义、值走 Settings → Keys。",
-					children: jsx(Button, { variant: "ghost", size: "sm", children: "指引" })
+					children: jsx(Button, {
+						variant: "ghost",
+						size: "sm",
+						onClick: () => onOpenChange(true),
+						children: "指引"
+					})
 				})
+			] }),
+			jsxs(Dialog, { open, onOpenChange, children: [
+				jsx(DialogContent, { "aria-label": "配置指引", className: "max-w-lg", children: jsxs("div", { className: "grid gap-3", children: [
+					jsx(DialogHeader, { children: jsx(DialogTitle, { children: "配置指引：打开界面、加 provider、填 Key" }) }),
+					jsx("div", { className: "text-xs text-(--ui-text-secondary)", children: GUIDE_OPEN_UI }),
+					jsx("div", { className: "text-xs text-(--ui-text-secondary)", children: GUIDE_ADD_PROVIDER }),
+					jsx(DialogFooter, { children: jsx(Button, {
+						variant: "secondary",
+						size: "sm",
+						onClick: () => onOpenChange(false),
+						children: "知道了"
+					}) })
+				] }) })
 			] }),
 			jsx(Textarea, {
 				readOnly: true,
@@ -562,7 +735,7 @@ function errorView(message) {
 	});
 }
 
-function linesView({ draft, k, handlers, note }) {
+function linesView({ draft, k, handlers, note, catalog, guide }) {
 	const warning = kMismatchWarning(k, draft.backends.length);
 	return jsxs("div", { className: "grid gap-4", children: [
 		note ? warningBar(note) : null,
@@ -573,8 +746,8 @@ function linesView({ draft, k, handlers, note }) {
 					lineCardView(line, index, handlers)
 				) }),
 		jsx(Button, { variant: "secondary", size: "sm", onClick: handlers.onAddLine, children: "＋ 添加线路" }),
-		optionsView(draft, handlers),
-		configStringView(draft)
+		optionsView(draft, catalog, handlers),
+		configStringView(draft, guide)
 	] });
 }
 
@@ -622,7 +795,9 @@ function PasteBox({ onApply }) {
 async function readGeometryExtras() {
 	// Best-effort: `plugins.manage list` only carries schema-declared keys, so
 	// an explicit `k` (never declared in config_schema) is only visible in the
-	// loaded config. Failure = no reading, never a failed page.
+	// loaded config — and a schema-declared dict key (ranker) reports its
+	// default when unset, so presence is read from the raw config too.
+	// Failure = no reading, never a failed page.
 	try {
 		const full = await host.request("config.get", { key: "full" });
 		const cfg = (full && full.config) || {};
@@ -633,10 +808,12 @@ async function readGeometryExtras() {
 		const legacy = web.federated && typeof web.federated === "object" ? web.federated : null;
 		return {
 			settingsK: typeof settings.k === "number" && Number.isFinite(settings.k) ? settings.k : null,
-			legacyK: legacy && typeof legacy.k === "number" && Number.isFinite(legacy.k) ? legacy.k : null
+			legacyK: legacy && typeof legacy.k === "number" && Number.isFinite(legacy.k) ? legacy.k : null,
+			settingsRanker: settings.ranker ?? null,
+			legacyRanker: legacy ? legacy.ranker ?? null : null
 		};
 	} catch {
-		return { settingsK: null, legacyK: null };
+		return { settingsK: null, legacyK: null, settingsRanker: null, legacyRanker: null };
 	}
 }
 
@@ -649,11 +826,39 @@ async function loadDraft() {
 	for (const field of row.settings_schema || []) {
 		if (field && typeof field.key === "string") values[field.key] = field.value;
 	}
-	const { draft, problems } = draftFromValues(values);
 	const extras = await readGeometryExtras();
+	const { draft, problems } = draftFromValues(values, {
+		settingsRanker: extras.settingsRanker,
+		legacyRanker: extras.legacyRanker
+	});
 	draft.explicitK = extras.settingsK;
 	draft.legacyK = extras.legacyK;
 	return { draft, problems, rawValues: values };
+}
+
+async function loadCatalog() {
+	// Read door for the desktop model directory (RPC `model.options` — the
+	// plugin SDK's host.request proxy; refresh defaults to false). Failure or
+	// emptiness never touches the draft: the ranker area shows the current
+	// value and the string doors stay usable.
+	try {
+		const result = await host.request("model.options", { explicit_only: true });
+		const providers = Array.isArray(result && result.providers)
+			? result.providers
+					.map((row) => ({
+						slug: asText(row && (row.slug || row.label)),
+						models: Array.isArray(row && row.models)
+							? row.models
+									.map((item) => asText(item && typeof item === "object" ? item.id || item.model || item.name : item))
+									.filter((name) => name !== "")
+							: []
+					}))
+					.filter((row) => row.slug !== "")
+			: [];
+		return { phase: providers.length ? "ok" : "empty", providers };
+	} catch {
+		return { phase: "error", providers: [] };
+	}
 }
 
 function ConfigPage() {
@@ -666,6 +871,8 @@ function ConfigPage() {
 		busy: false
 	});
 	const [deleteIndex, setDeleteIndex] = useState(null);
+	const [guideOpen, setGuideOpen] = useState(false);
+	const [catalog, setCatalog] = useState({ phase: "loading", providers: [] });
 
 	const refresh = useCallback(async () => {
 		try {
@@ -690,9 +897,14 @@ function ConfigPage() {
 		}
 	}, []);
 
+	const refreshCatalog = useCallback(async () => {
+		setCatalog(await loadCatalog());
+	}, []);
+
 	useEffect(() => {
 		void refresh();
-	}, [refresh]);
+		void refreshCatalog();
+	}, [refresh, refreshCatalog]);
 
 	const write = useCallback(
 		async (next) => {
@@ -730,11 +942,17 @@ function ConfigPage() {
 			onField: (index, field, value) => {
 				if (state.draft) void write(updateLineField(state.draft, index, field, value));
 			},
-			onType: (index, value) => {
-				if (state.draft) void write(updateLineField(state.draft, index, "type", value));
+			onLinePool: (index, value) => {
+				if (state.draft) void write(updateLineField(state.draft, index, "pool_strategy", value));
 			},
 			onOption: (key, value) => {
 				if (state.draft) void write(updateOption(state.draft, key, value));
+			},
+			onRankerProvider: (value) => {
+				if (state.draft) void write(updateRanker(state.draft, "provider", value));
+			},
+			onRankerModel: (value) => {
+				if (state.draft) void write(updateRanker(state.draft, "model", value));
 			},
 			onAddLine: () => {
 				if (state.draft) void write(addLine(state.draft));
@@ -767,7 +985,14 @@ function ConfigPage() {
 			className: "text-xs text-(--ui-text-tertiary)",
 			children: "本页作用于当前网关 profile 的 settings 树。改了立即写回并回读。"
 		}),
-		jsx(ScrollArea, { children: linesView({ draft, k: effectiveK, handlers, note }) }),
+		jsx(ScrollArea, { children: linesView({
+			draft,
+			k: effectiveK,
+			handlers,
+			note,
+			catalog,
+			guide: { open: guideOpen, setOpen: setGuideOpen }
+		}) }),
 		state.saveError ? warningBar(`保存失败：${state.saveError}`) : null,
 		state.busy ? jsx(Loader, {}) : null,
 		state.problems.length
@@ -831,7 +1056,11 @@ export const __test = {
 	PLUGIN_KEY,
 	WIDGET_VERSION,
 	DEFAULT_OPTIONS,
+	POOL_INHERIT,
 	emptyDraft,
+	emptyRanker,
+	readRanker,
+	rankerFromDraft,
 	draftFromValues,
 	settingsFromDraft,
 	validateDraft,
@@ -841,14 +1070,17 @@ export const __test = {
 	excludeKey,
 	updateLineField,
 	updateOption,
+	updateRanker,
 	addLine,
 	addKey,
 	draftToConfigText,
 	parseConfigText,
 	loadDraft,
+	loadCatalog,
 	readGeometryExtras,
 	linesView,
 	optionsView,
+	rankerView,
 	lineCardView,
 	keyCardView,
 	emptyView,

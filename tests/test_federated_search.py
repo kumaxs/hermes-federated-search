@@ -1122,6 +1122,29 @@ class TestReadConfigMergesSettings:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             assert _read_config() is None
 
+    def test_legacy_global_pool_strategy_inherited_when_settings_absent(self, tmp_path) -> None:
+        """settings 树没有 pool_strategy 时，legacy 的全局值继续生效（顶层键合并）。"""
+        self._write(tmp_path, {
+            "web": {
+                "federated": {
+                    "backends": [{"name": "tavily"}],
+                    "pool_strategy": "round_robin",
+                },
+            },
+            "plugins": {
+                "entries": {
+                    "hermes-federated-search": {
+                        "settings": {"timeout": 22},
+                    },
+                },
+            },
+        })
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            cfg = _read_config()
+        assert cfg is not None
+        assert cfg["pool_strategy"] == "round_robin"   # legacy global default survives
+        assert cfg["timeout"] == 22                    # settings key still wins
+
 
 class TestCardPool:
     """Pool selection strategies and cooldown bookkeeping."""
@@ -1154,6 +1177,25 @@ class TestCardPool:
         random.seed(1234)
         picks = {pool.select("line", cards, "random") for _ in range(40)}
         assert picks == {"CARD_A", "CARD_B"}
+
+    def test_missing_line_strategy_uses_global_default(self, provider) -> None:
+        """线路缺 pool_strategy → 回退全局缺省（provider.py:721-723 → :970）。"""
+        from provider import _CardPool, _POOL_STRATEGIES
+
+        # 全局键（settings/legacy 合并后）设置默认策略
+        pool = provider._get_card_pool({"pool_strategy": "round_robin"})
+        assert isinstance(pool, _CardPool)
+        assert pool.default_strategy == "round_robin"
+
+        # 线路未给策略（search 传 None）→ 按全局缺省轮换
+        cards = ["CARD_A", "CARD_B"]
+        picks = [pool.select("line", cards, None) for _ in range(3)]
+        assert picks == ["CARD_A", "CARD_B", "CARD_A"]
+
+        # 全局也非法/缺失 → 仍回退到模块默认
+        pool = _CardPool()
+        assert pool.select("line", cards, "bogus") == "CARD_A"
+        assert _POOL_STRATEGIES[0] == "fill_first"  # default constant sanity
 
     def test_cooldowns_expire(self) -> None:
         import time as _time
@@ -1633,7 +1675,7 @@ class TestConfigSchema:
         schema = data.get("config_schema")
         assert set(schema) == {
             "backends", "timeout", "max_results", "min_backends",
-            "ranking_mode", "pool_strategy",
+            "ranking_mode", "pool_strategy", "ranker",
         }
         segment = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
         reserved = {"model", "plugins", "security", "settings"}
@@ -1652,6 +1694,9 @@ class TestConfigSchema:
         assert schema["ranking_mode"]["default"] == "auto"
         assert schema["pool_strategy"]["choices"] == ["fill_first", "round_robin", "random"]
         assert schema["pool_strategy"]["default"] == "fill_first"
+        # ranker 是 dict 键：UI 写入 settings.ranker 依赖 schema 放行（plugins_settings.py:116-140）
+        assert str(schema["ranker"]["type"]).lower() == "dict"
+        assert schema["ranker"]["default"] == {}
 
         import provider as provider_mod
 

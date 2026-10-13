@@ -126,6 +126,27 @@ class SerializationRoundTripTest(unittest.TestCase):
             ["TAVILY_API_KEY", "TAVILY_API_KEY_2"],
         )
 
+    def test_two_card_structures_round_trip(self):
+        """新旧两种卡片结构并存：credentials 池与 api_key_env 单卡都要活。"""
+        compat = run_harness("compat")
+        self.assertTrue(compat["twoCardStructures"])
+        self.assertEqual(compat["problems"], [], "compat fixture must load clean")
+
+    def test_legacy_card_keeps_api_key_env_and_unknown_keys(self):
+        """旧卡（api_key_env/required/未知键）原样往返；type 不注入。"""
+        compat = run_harness("compat")
+        self.assertTrue(compat["legacyCardKept"])
+        self.assertTrue(compat["typeNotInjected"], "a typeless line got a type injected")
+        self.assertTrue(compat["registeredKept"], "a registered line lost its type")
+        self.assertTrue(compat["typesRoundTrip"])
+
+    def test_ranker_tree_round_trips_with_write_rules(self):
+        """ranker 整树写回：prompt 保留；清空叶删键；无现值零自动写入。"""
+        rules = run_harness("compat")["rankerRoundTrip"]
+        self.assertTrue(rules["rankerKept"], "ranker provider/model/prompt did not survive")
+        self.assertTrue(rules["rankerCleared"], "clearing provider dropped prompt siblings")
+        self.assertTrue(rules["rankerOmitted"], "an empty draft wrote an empty ranker key")
+
 
 class MembershipMappingTest(unittest.TestCase):
     """② 两级勾选→payload 映射（含取消勾选与 k 警告）。"""
@@ -167,6 +188,13 @@ class MembershipMappingTest(unittest.TestCase):
             "the validation message echoed the offending value",
         )
         self.assertRegex(bad_env, r"\^\[A-Z\]\[A-Z0-9_\]\{0,127\}\$")
+
+    def test_per_line_pool_strategy_round_trip(self):
+        """卡内 pool_strategy：选值写、清空删键、存量空串未触碰原样。"""
+        pool = run_harness("compat")["perLinePoolRoundTrip"]
+        self.assertTrue(pool["poolWritten"], "a chosen per-line strategy was not written")
+        self.assertTrue(pool["poolDeleted"], "clearing the select kept the key")
+        self.assertTrue(pool["poolEmptyKept"], "a legacy empty string was rewritten")
 
 
 class RenderSmokeTest(unittest.TestCase):

@@ -10,7 +10,7 @@
  * source (no copy), the same way `tests/test_desktop_widget.py` pin
  * `WIDGET_VERSION` against `plugin.yaml`.
  *
- * usage: node tests/widget_harness.cjs <roundtrip|mapping|render|illegal>
+ * usage: node tests/widget_harness.cjs <roundtrip|mapping|render|illegal|compat>
  * prints: one JSON object on stdout; a non-zero exit with the message on stderr
  *         when the widget itself cannot be loaded.
  */
@@ -41,7 +41,8 @@ const hooks = {
 };
 
 const SDK_COMPONENTS = [
-	"Badge", "Button", "Checkbox", "ConfirmDialog", "EmptyState", "ErrorState",
+	"Badge", "Button", "Checkbox", "ConfirmDialog", "Dialog", "DialogContent",
+	"DialogFooter", "DialogHeader", "DialogTitle", "EmptyState", "ErrorState",
 	"Input", "Loader", "RowButton", "ScrollArea", "SegmentedControl", "Select",
 	"SelectContent", "SelectItem", "SelectTrigger", "SelectValue", "Separator",
 	"Textarea", "Tip"
@@ -132,14 +133,17 @@ function sampleValues() {
 				name: "minimax",
 				type: "custom",
 				api_key_env: "MINIMAX_CN_API_KEY",
-				base_url: "https://api.example.invalid/minimax"
+				required: false,
+				base_url: "https://api.example.invalid/minimax",
+				x_unknown_key: "kept-by-the-card"
 			}
 		],
 		timeout: 10,
 		max_results: 8,
 		min_backends: 1,
 		ranking_mode: "auto",
-		pool_strategy: "fill_first"
+		pool_strategy: "fill_first",
+		ranker: { provider: "openai-codex", model: "gpt-6-luna", prompt: "keep me" }
 	};
 }
 
@@ -151,8 +155,10 @@ function handlers() {
 	const noop = () => {};
 	return {
 		onField: noop,
-		onType: noop,
+		onLinePool: noop,
 		onOption: noop,
+		onRankerProvider: noop,
+		onRankerModel: noop,
 		onAddLine: noop,
 		onAddKey: noop,
 		onExcludeLine: noop,
@@ -275,11 +281,89 @@ function modeIllegal() {
 	};
 }
 
+function modeCompat() {
+	const { test } = loadWidget(makeHost());
+	// Two card structures side by side (legacy api_key_env + required + unknown
+	// key; credentials pool), a typeless line (registered semantics) and a
+	// verbatim `registered` line. Nothing here may be invented, injected or
+	// dropped by a round trip.
+	const values = {
+		backends: [
+			{
+				name: "tavily",
+				type: "custom",
+				base_url: "https://api.example.invalid/tavily",
+				credentials: ["TAVILY_API_KEY"]
+			},
+			{
+				name: "minimax",
+				api_key_env: "MINIMAX_CN_API_KEY",
+				base_url: "https://api.example.invalid/minimax",
+				required: true,
+				x_unknown_key: "kept"
+			},
+			{ name: "searx", base_url: "https://api.example.invalid/searx" },
+			{ name: "reg", type: "registered" }
+		],
+		ranker: { provider: "openai-codex", model: "gpt-6-luna", prompt: "keep me" }
+	};
+	const loaded = test.draftFromValues(values);
+	const payload = test.settingsFromDraft(loaded.draft);
+	const has = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+
+	// Per-line pool strategy: choosing one writes it; emptying the select on a
+	// line that had one deletes the key; a legacy empty string left untouched
+	// round-trips as-is.
+	const poolDraft = test.updateLineField(loaded.draft, 0, "pool_strategy", "round_robin");
+	const poolWritten = test.settingsFromDraft(poolDraft).backends[0].pool_strategy === "round_robin";
+	const srcWithStrategy = {
+		backends: [{ name: "l", type: "custom", base_url: "https://x.example.invalid", credentials: ["A"], pool_strategy: "random" }]
+	};
+	const poolCleared = test.updateLineField(test.draftFromValues(srcWithStrategy).draft, 0, "pool_strategy", "");
+	const poolDeleted = !has(test.settingsFromDraft(poolCleared).backends[0], "pool_strategy");
+	const srcEmptyPool = {
+		backends: [{ name: "l", type: "custom", base_url: "https://x.example.invalid", credentials: ["A"], pool_strategy: "" }]
+	};
+	const poolEmptyKept = test.settingsFromDraft(test.draftFromValues(srcEmptyPool).draft).backends[0].pool_strategy === "";
+
+	// Ranker: whole-tree write keeps prompt/unknown keys; clearing the provider
+	// deletes the leaf; nothing existed + nothing chosen = key omitted.
+	const cleared = test.updateRanker(loaded.draft, "provider", "");
+	const clearedPayload = test.settingsFromDraft(cleared);
+	const rankerKept =
+		!!payload.ranker &&
+		payload.ranker.provider === "openai-codex" &&
+		payload.ranker.model === "gpt-6-luna" &&
+		payload.ranker.prompt === "keep me";
+	const rankerCleared =
+		!!clearedPayload.ranker &&
+		!has(clearedPayload.ranker, "provider") &&
+		clearedPayload.ranker.model === "gpt-6-luna" &&
+		clearedPayload.ranker.prompt === "keep me";
+	const rankerOmitted = !has(test.settingsFromDraft(test.draftFromValues({ backends: [] }).draft), "ranker");
+
+	return {
+		mode: "compat",
+		problems: loaded.problems,
+		twoCardStructures:
+			payload.backends[0].credentials.length === 1 &&
+			payload.backends[1].api_key_env === "MINIMAX_CN_API_KEY",
+		legacyCardKept:
+			payload.backends[1].required === true && payload.backends[1].x_unknown_key === "kept",
+		typeNotInjected: !has(payload.backends[2], "type"),
+		registeredKept: payload.backends[3].type === "registered",
+		typesRoundTrip: payload.backends[0].type === "custom" && payload.backends[1].type === undefined,
+		perLinePoolRoundTrip: { poolWritten, poolDeleted, poolEmptyKept },
+		rankerRoundTrip: { rankerKept, rankerCleared, rankerOmitted }
+	};
+}
+
 const MODES = {
 	roundtrip: modeRoundTrip,
 	mapping: modeMapping,
 	render: modeRender,
-	illegal: modeIllegal
+	illegal: modeIllegal,
+	compat: modeCompat
 };
 
 function main() {
