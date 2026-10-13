@@ -57,6 +57,11 @@ A human-facing card editor on top of the Phase 2 settings exposure
 - **Credential policy unchanged and visible:** the page records environment
   variable NAMES only — no value input, no value echo. Values go through
   Settings → Keys (`PUT /api/env`). See `docs/agent-config.md`.
+- **No migration.** Whatever is already in the settings tree (or legacy
+  `web.federated`) loads into the card page as-is; nothing is rewritten behind
+  your back — an explicit `k` that mismatches the line count shows a warning
+  bar only. Registered-provider lines stay single-card; multi-card remains
+  `custom`-only.
 
 ## Install & Enable
 
@@ -74,6 +79,26 @@ Or copy/symlink this directory into the plugin directory yourself:
 
 - global: `~/.hermes/plugins/hermes-federated-search/`
 - profile-scoped: `~/.hermes/profiles/<profile>/plugins/hermes-federated-search/`
+
+Pinning an exact revision works from a checkout or archive:
+`hermes plugins install <source> --ref <40-hex SHA> --enable` — the phase-3
+branch head was installed this way in the local drill (byte-identical install,
+same live reload as below).
+
+**Desktop half (phase 3).** The plugin ships a desktop package
+(`desktop/plugin.js`). The desktop app reconciles it into the app-level root
+`~/.hermes/desktop-plugins/hermes-federated-search/` (marker
+`.hermes-package.json`; `source` = the agent half's `desktop/` directory).
+Measured: the settle lands within seconds once the app's reconcile pass runs —
+touching `~/.hermes/desktop-plugins/` triggers it. If the settings entry does
+not appear, use ⌘K → "Reload desktop plugins" (or open Capabilities → Plugins);
+a load failure shows an error toast. Rolling the agent half back prunes the
+desktop half on the next reconcile pass.
+
+**Validate note.** `hermes plugins validate` passes on a clean export of the
+phase-3 head; it may print one `security scan caution: dump_all_env
+(plugin.js:333)` line — a literal heuristic matching the JS fallback
+`env || "（未命名）"`, not an env dump (no failure).
 
 **Activation semantics (opt-in user plugin):**
 
@@ -101,10 +126,13 @@ Or copy/symlink this directory into the plugin directory yourself:
   `Federated search: '<query>' (N/M backends active, …)`.
 - A fresh search succeeds through the `federated` provider (`success=true`,
   at least one result).
-- Desktop (phase 2): Settings → Plugins → hermes-federated-search shows the
-  six-key form — `backends` as a JSON editor, number fields for `timeout` /
-  `max_results` / `min_backends`, and the `ranking_mode` / `pool_strategy`
-  dropdowns; reopening the form shows saved values.
+- Desktop (phase 3): Settings → Plugins → 「聚合搜索」 opens the card page —
+  one card per line with two membership levels (L1 参与聚合 = member of
+  `backends`; L2 参与 = member of the line's `credentials`), add/remove for
+  lines and keys, and the 当前配置字符串 box with paste-import. Every edit
+  serializes and is written back through `plugins.manage settings`; reopen the
+  page to re-read the saved string. The six-key `config_schema` form stays
+  available as the "Agent settings" sub-page.
 
 **Disable / roll back:**
 
@@ -113,7 +141,7 @@ Or copy/symlink this directory into the plugin directory yourself:
 - Fully remove: `hermes plugins remove hermes-federated-search` — add
   `--allow-live-gateway` when the gateway keeps running (a guard blocks
   removal otherwise; measured to deregister the provider live, no restart
-  needed).
+  needed). The phase-3 desktop half is pruned by the app's next reconcile pass.
 
 Requirements: `httpx` (present in Hermes environments). Config reading uses
 `hermes_yaml` when available (Hermes checkouts) and falls back to PyYAML.
@@ -464,7 +492,7 @@ restart.
 
 ## Status
 
-v1.0.0 base plus the phase-2 improvements:
+v1.0.0 base plus the phase-2 and phase-3 improvements:
 
 - **Included (v1.0.0):** parallel aggregation with `k` / `min_backends` /
   `required` semantics; timeout with partial results; keyword ranking plus
@@ -478,6 +506,14 @@ v1.0.0 base plus the phase-2 improvements:
   per-line multi-card credential pools (`fill_first` / `round_robin` /
   `random`) with automatic failover and pool-aligned cooldowns;
   `ranking_mode` (auto | keyword | llm).
+- **Included (phase 3, branch `feat/p3-card-config-ui`):** desktop card editor
+  (`desktop/plugin.js`, `ctx.registerSettingsPage`) — one card per line with
+  L1/L2 membership checkboxes, add/remove lines and keys, current-settings
+  string with paste import, string ↔ UI parity (unchecking removes the member,
+  no private state); the six-key form stays as the Agent settings sub-page;
+  plus `docs/agent-config.md` (agent-side configuration guide) and the
+  desktop-widget test harness (`tests/test_desktop_widget.py`,
+  `tests/widget_harness.cjs`).
 - **Not included:** multi-card on registered providers (host interface takes
   no key) and direct credential-pool (`auth.json`) consumption — future
   increments; per-backend `timeout` / `weight` / `result_limit` —
