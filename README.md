@@ -25,8 +25,9 @@ tool chain are required.
 
 Two additions on top of v1.0.0 (branch `feat/p2-config-multicard`):
 
-- **Settings-page exposure.** The plugin declares six keys (`backends`,
-  `timeout`, `max_results`, `min_backends`, `ranking_mode`, `pool_strategy`)
+- **Settings-page exposure.** The plugin declares seven keys (`backends`,
+  `timeout`, `max_results`, `min_backends`, `ranking_mode`, `pool_strategy`,
+  `ranker`)
   through the official `config_schema` mechanism (manifest v2), so
   Settings → Plugins renders an editable form and saves them under
   `plugins.entries.hermes-federated-search.settings`. Values merge per
@@ -37,6 +38,31 @@ Two additions on top of v1.0.0 (branch `feat/p2-config-multicard`):
   `fill_first` / `round_robin` / `random`; a failing card cools down and the
   request fails over to the next usable card. Key values stay in the runtime
   environment — only names ever go into configuration.
+
+## What's New in Phase 3
+
+A human-facing card editor on top of the Phase 2 settings exposure
+(branch `feat/p3-card-config-ui`):
+
+- **Card-per-line config page** under Settings → Plugins → 「聚合搜索」
+  (`desktop/plugin.js`, registered via `ctx.registerSettingsPage`): one card
+  per line with two levels of membership — L1 参与聚合 (member of `backends`)
+  and L2 参与 (member of that line's `credentials`); add/remove lines and keys;
+  every edit serializes and writes straight back through
+  `plugins.manage settings`, then re-reads. The manifest `config_schema` form
+  stays available as the entry's **Agent settings** sub-page.
+- **String ↔ UI parity.** The page shows the current settings string (YAML/JSON
+  for agents) and takes a pasted string back; the settings tree stays the one
+  source of truth — unchecking a box removes the member from the string, with
+  no private residue.
+- **Credential policy unchanged and visible:** the page records environment
+  variable NAMES only — no value input, no value echo. Values go through
+  Settings → Keys (`PUT /api/env`). See `docs/agent-config.md`.
+- **No migration.** Whatever is already in the settings tree (or legacy
+  `web.federated`) loads into the card page as-is; nothing is rewritten behind
+  your back — an explicit `k` that mismatches the line count shows a warning
+  bar only. Registered-provider lines stay single-card; multi-card remains
+  `custom`-only.
 
 ## Install & Enable
 
@@ -54,6 +80,26 @@ Or copy/symlink this directory into the plugin directory yourself:
 
 - global: `~/.hermes/plugins/hermes-federated-search/`
 - profile-scoped: `~/.hermes/profiles/<profile>/plugins/hermes-federated-search/`
+
+Pinning an exact revision works from a checkout or archive:
+`hermes plugins install <source> --ref <40-hex SHA> --enable` — the phase-3
+branch head was installed this way in the local drill (byte-identical install,
+same live reload as below).
+
+**Desktop half (phase 3).** The plugin ships a desktop package
+(`desktop/plugin.js`). The desktop app reconciles it into the app-level root
+`~/.hermes/desktop-plugins/hermes-federated-search/` (marker
+`.hermes-package.json`; `source` = the agent half's `desktop/` directory).
+Measured: the settle lands within seconds once the app's reconcile pass runs —
+touching `~/.hermes/desktop-plugins/` triggers it. If the settings entry does
+not appear, use ⌘K → "Reload desktop plugins" (or open Capabilities → Plugins);
+a load failure shows an error toast. Rolling the agent half back prunes the
+desktop half on the next reconcile pass.
+
+**Validate note.** `hermes plugins validate` passes on a clean export of the
+phase-3 head; it may print one `security scan caution: dump_all_env
+(plugin.js:333)` line — a literal heuristic matching the JS fallback
+`env || "（未命名）"`, not an env dump (no failure).
 
 **Activation semantics (opt-in user plugin):**
 
@@ -81,10 +127,18 @@ Or copy/symlink this directory into the plugin directory yourself:
   `Federated search: '<query>' (N/M backends active, …)`.
 - A fresh search succeeds through the `federated` provider (`success=true`,
   at least one result).
-- Desktop (phase 2): Settings → Plugins → hermes-federated-search shows the
-  six-key form — `backends` as a JSON editor, number fields for `timeout` /
-  `max_results` / `min_backends`, and the `ranking_mode` / `pool_strategy`
-  dropdowns; reopening the form shows saved values.
+- Desktop (phase 3): Settings → Plugins → 「聚合搜索」 opens the card page —
+  one card per line with two membership levels (L1 参与聚合 = member of
+  `backends`; L2 参与 = member of the line's `credentials`), add/remove for
+  lines and keys, a per-line 「Key 轮换策略（pool_strategy）」 select and the
+  当前配置字符串 box with paste-import. Every edit serializes and is written
+  back through `plugins.manage settings`; reopen the page to re-read the saved
+  string. The seven-key `config_schema` form stays available as the "Agent
+  settings" sub-page.
+- Desktop half is opt-in: the `.hermes-package.json` bundle ships it disabled
+  by default — enable it via 桌面 Hermes → 设置 → 技能与工具 → 插件 → open
+  hermes-federated-search, then 设置 → 插件 →「聚合搜索」 (full path and the
+  ⌘K →「Reload desktop plugins」 fallback: `docs/agent-config.md`).
 
 **Disable / roll back:**
 
@@ -93,7 +147,7 @@ Or copy/symlink this directory into the plugin directory yourself:
 - Fully remove: `hermes plugins remove hermes-federated-search` — add
   `--allow-live-gateway` when the gateway keeps running (a guard blocks
   removal otherwise; measured to deregister the provider live, no restart
-  needed).
+  needed). The phase-3 desktop half is pruned by the app's next reconcile pass.
 
 Requirements: `httpx` (present in Hermes environments). Config reading uses
 `hermes_yaml` when available (Hermes checkouts) and falls back to PyYAML.
@@ -119,6 +173,37 @@ With this configuration, every `web_search` call queries both Tavily and MiniMax
 in parallel, merges results, ranks by keyword scoring, and returns up to 8
 results.
 
+## Agent: configure by string
+
+Both doors edit the same tree, so an agent can do the whole configuration by
+editing the string (or by pasting it into the card page):
+
+```yaml
+plugins:
+  entries:
+    hermes-federated-search:
+      settings:
+        backends:
+          - name: tavily
+            type: custom
+            base_url: "https://api.example.invalid/search"
+            credentials: [TAVILY_API_KEY, TAVILY_API_KEY_2]   # names only
+        min_backends: 1
+        ranking_mode: auto
+```
+
+- `plugins.entries.hermes-federated-search.settings` is the single source of
+  truth; legacy `web.federated` still works and merges per top-level key
+  (settings win). The card page never rewrites the legacy block.
+- `credentials` lists **environment variable names** (`^[A-Z][A-Z0-9_]{0,127}$`)
+  and nothing else — a pasted key value is rejected at config validation
+  without echoing it. Key values belong to Settings → Keys (`PUT /api/env`).
+- An explicit `k` must equal the number of `backends`; leave it out (the UI
+  does) and the line count is used. A mismatched explicit `k` is shown as a
+  warning bar — never rewritten automatically.
+- After a string edit, reopen the page to see it (open = refetch). Full guide:
+  [`docs/agent-config.md`](docs/agent-config.md).
+
 ## Configuration Reference
 
 Federated configuration can be written in two places; they merge per
@@ -126,9 +211,9 @@ top-level key, with the official settings tree winning:
 
 - **Settings → Plugins** (official form). Values are stored under
   `plugins.entries.hermes-federated-search.settings` in `config.yaml`. The
-  six keys declared by the plugin (`plugin.yaml` `config_schema`):
+  seven keys declared by the plugin (`plugin.yaml` `config_schema`):
   `backends`, `timeout`, `max_results`, `min_backends`, `ranking_mode`,
-  `pool_strategy`.
+  `pool_strategy`, `ranker`.
 - **`web.federated`** in `config.yaml` — the legacy location, still fully
   supported; no migration is required.
 
@@ -142,12 +227,12 @@ use the settings page (or edit `config.yaml` directly) instead.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `timeout` | int | `10` | Maximum seconds to wait for all backends. If the deadline expires, partial results from completed backends are returned. |
+| `timeout` | int | `10` | Total deadline for all backends. Lines that miss it are dropped; lines that already returned contribute their partial results. |
 | `max_results` | int | `8` | Maximum number of results returned after ranking (ceiling). The caller's `limit` parameter is still respected — the actual output count is `min(limit, max_results)`. |
 | `k` | int | len(backends) | **K-way aggregation.** Must equal the number of configured backends. When explicitly set, the plugin validates `len(backends) == k`. Maximum 32. |
-| `min_backends` | int | `1` | Minimum number of backends that must succeed for the search to be considered successful. Must satisfy `1 ≤ min_backends ≤ k`. |
+| `min_backends` | int | `1` | Minimum number of backends that must **return results** for the search to be considered successful. A line succeeds when it answers with a result-bearing response within the deadline. Must satisfy `1 ≤ min_backends ≤ k`; `required` lines must always succeed. |
 | `ranking_mode` | str | `auto` | Ranking mode: `auto` (follows `ranker.provider` as before), `keyword` (force keyword scoring), `llm` (force LLM ranking; uses the default auxiliary model when `ranker.provider` is unset). The `ranker` dict stays usable alongside. |
-| `pool_strategy` | str | `fill_first` | Multi-card rotation for custom lines with `credentials`: `fill_first` (use one card until it fails), `round_robin` (rotate per request), `random`. Overridable per line. |
+| `pool_strategy` | str | `fill_first` | Global default rotation for custom lines with `credentials`: `fill_first` (use one card until it fails), `round_robin` (rotate per request), `random`. Overridable per line (the card editor exposes the select inside each line card); the key itself is kept and stays read+write for compatibility. |
 | `ranker` | dict | — | Optional LLM ranking configuration (see below). |
 | `health_check` | dict | — | Optional cached health probing (see below). When absent, all backends are dispatched directly (backward compatible). |
 | `backends` | list | — | **Required.** List of sub-backend configurations. |
@@ -413,7 +498,7 @@ restart.
 
 ## Status
 
-v1.0.0 base plus the phase-2 improvements:
+v1.0.0 base plus the phase-2 and phase-3 improvements:
 
 - **Included (v1.0.0):** parallel aggregation with `k` / `min_backends` /
   `required` semantics; timeout with partial results; keyword ranking plus
@@ -427,6 +512,23 @@ v1.0.0 base plus the phase-2 improvements:
   per-line multi-card credential pools (`fill_first` / `round_robin` /
   `random`) with automatic failover and pool-aligned cooldowns;
   `ranking_mode` (auto | keyword | llm).
+- **Included (phase 3, branch `feat/p3-card-config-ui`):** desktop card editor
+  (`desktop/plugin.js`, `ctx.registerSettingsPage`) — one card per line with
+  L1/L2 membership checkboxes, add/remove lines and keys, current-settings
+  string with paste import, string ↔ UI parity (unchecking removes the member,
+  no private state); the schema form stays as the Agent settings sub-page;
+  plus `docs/agent-config.md` (agent-side configuration guide) and the
+  desktop-widget test harness (`tests/test_desktop_widget.py`,
+  `tests/widget_harness.cjs`).
+- **Included (phase 3 revision, v1.1.0):** agent guidance aligned with the
+  real enable path (opt-in desktop half, `docs/agent-config.md` + in-page 指引
+  dialog); type select/badge removed — typeless lines stay typeless, new
+  cards are `custom`, legacy cards keep `api_key_env`/`required`/unknown keys
+  verbatim; a ranker model picker on the card page (`ranker` joins
+  `config_schema`, written as a whole tree via `settings.ranker`); the pool
+  strategy select moved into each line card (`pool_strategy` per line, the
+  global key stays a read+write default); timeout / min_backends wording
+  aligned with the runtime semantics.
 - **Not included:** multi-card on registered providers (host interface takes
   no key) and direct credential-pool (`auth.json`) consumption — future
   increments; per-backend `timeout` / `weight` / `result_limit` —
