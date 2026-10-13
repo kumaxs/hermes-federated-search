@@ -21,14 +21,32 @@ tool chain are required.
 - **Zero tool changes.** The `web_search` tool passes results through the same
   pipeline; the provider boundary is transparent to the agent.
 
+## What's New in Phase 2
+
+Two additions on top of v1.0.0 (branch `feat/p2-config-multicard`):
+
+- **Settings-page exposure.** The plugin declares six keys (`backends`,
+  `timeout`, `max_results`, `min_backends`, `ranking_mode`, `pool_strategy`)
+  through the official `config_schema` mechanism (manifest v2), so
+  Settings → Plugins renders an editable form and saves them under
+  `plugins.entries.hermes-federated-search.settings`. Values merge per
+  top-level key with the legacy `web.federated` block (settings win) — no
+  migration required.
+- **Multi-card credential pools.** A `custom` line can list several
+  environment variable names under `credentials` and rotate them with
+  `fill_first` / `round_robin` / `random`; a failing card cools down and the
+  request fails over to the next usable card. Key values stay in the runtime
+  environment — only names ever go into configuration.
+
 ## Install & Enable
 
 The plugin is a plain directory plugin (no Python packaging step). Install it
 into a Hermes home/profile and enable it:
 
 ```sh
-# from GitHub (recommended)
-hermes plugins install kumaxs/hermes-federated-search
+# from GitHub (recommended) — enables the plugin in the same step
+hermes plugins install kumaxs/hermes-federated-search --enable
+# ... or, for an already installed plugin:
 hermes plugins enable hermes-federated-search
 ```
 
@@ -39,20 +57,43 @@ Or copy/symlink this directory into the plugin directory yourself:
 
 **Activation semantics (opt-in user plugin):**
 
-- Like any user plugin, it is loaded when the gateway starts — after
-  enabling/disabling, restart the gateway and start a new session so the tool
-  surface and provider registry see the plugin.
+- With a running gateway, `hermes plugins install … --enable` asks it to
+  reload plugins live — measured message: `Gateway reloaded plugins; nothing
+  of this plugin needs a session or restart.` No gateway restart is
+  required.
+- If the gateway is not running, or reports `reloaded=false` (older builds),
+  start/restart it and open a new session so the provider registry sees the
+  plugin.
 - `web.search_backend`, `web.federated` and
   `plugins.entries.hermes-federated-search.settings` are read on each search
   call — config edits (including settings-page saves) take effect without a
   restart.
 
+**After enabling — expected signals:**
+
+- `hermes plugins show hermes-federated-search` → `Status: enabled`.
+- Config readback (`grep -n federated <profile>/config.yaml`):
+  `search_backend: federated` plus the `federated:` block — or the
+  `plugins.entries.hermes-federated-search.settings` tree when the keys were
+  saved from the settings page.
+- Gateway log lines: `Plugin 'hermes-federated-search' registered web
+  provider: federated`, and per-query
+  `Federated search: '<query>' (N/M backends active, …)`.
+- A fresh search succeeds through the `federated` provider (`success=true`,
+  at least one result).
+- Desktop (phase 2): Settings → Plugins → hermes-federated-search shows the
+  six-key form — `backends` as a JSON editor, number fields for `timeout` /
+  `max_results` / `min_backends`, and the `ranking_mode` / `pool_strategy`
+  dropdowns; reopening the form shows saved values.
+
 **Disable / roll back:**
 
 - Point `web.search_backend` back at your previous backend (e.g. `tavily`), or
   remove the key — takes effect on the next search call.
-- Fully remove: `hermes plugins disable hermes-federated-search` (restart the
-  gateway) and delete the plugin directory.
+- Fully remove: `hermes plugins remove hermes-federated-search` — add
+  `--allow-live-gateway` when the gateway keeps running (a guard blocks
+  removal otherwise; measured to deregister the provider live, no restart
+  needed).
 
 Requirements: `httpx` (present in Hermes environments). Config reading uses
 `hermes_yaml` when available (Hermes checkouts) and falls back to PyYAML.
