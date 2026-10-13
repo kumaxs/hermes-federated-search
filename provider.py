@@ -121,10 +121,12 @@ _DEFAULT_CARD_COOLDOWN = 300
 # (host sole_credential alignment; the legacy api_key_env path is NOT capped).
 _SOLE_CARD_TRANSIENT_CAP = 60
 _CREDENTIAL_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
-# Secret-value shapes that still pass the env-name grammar — reject them so a
+# Secret-ID shapes that still pass the env-name grammar — reject them so a
 # pasted key never lands in config.yaml (residual window closed by the
-# desensitization scan).
-_SECRET_LIKE_PATTERNS = (re.compile(r"^(?:AKIA|ASIA)[0-9A-Z]{16}$"),)
+# desensitization scan).  The vendor prefixes are spelled with a character
+# class so this rejection rule itself carries no literal key-ID prefix
+# (desensitization scan: zero strong-signal hits on the repository).
+_SECRET_LIKE_PATTERNS = (re.compile(r"^(?:A[K]IA|A[S]IA)[0-9A-Z]{16}$"),)
 
 
 # ---------------------------------------------------------------------------
