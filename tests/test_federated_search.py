@@ -726,6 +726,34 @@ class TestRankResultsCustomPrompt:
             system_msg = messages[0]["content"]
             assert "Return ONLY a JSON array" in system_msg
 
+    def test_rank_call_pins_reasoning_off(self) -> None:
+        """The ranking call pins reasoning_effort=off on its extra_body."""
+        from provider import _RANK_TIMEOUT, _rank_results
+
+        results = [
+            {"title": f"R{i}", "url": f"https://r{i}.com", "description": f"D{i}"}
+            for i in range(5)
+        ]
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="[2,1,3,4,5]"))
+        ]
+
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=mock_response,
+        ) as mock_call:
+            ranked = _rank_results(
+                "test",
+                results,
+                {"provider": "commandcode", "model": "deepseek/deepseek-v4.1-flash"},
+            )
+            assert len(ranked) == 5
+            kwargs = mock_call.call_args[1]
+            assert kwargs["task"] == "web_extract"
+            assert kwargs["timeout"] == _RANK_TIMEOUT
+            assert kwargs["extra_body"] == {"reasoning_effort": "off"}
+
 
 # ---------------------------------------------------------------------------
 # Integration: required backends + min_backends

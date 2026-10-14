@@ -259,6 +259,14 @@ The `ranker` section controls how merged results are ordered by relevance.
 **Recommendation:** Use a non-main-model provider for ranking to avoid
 concurrency contention. When ≤ 3 results, ranking is skipped entirely.
 
+**Thinking is disabled on the ranking call.** The ranking request always
+carries `extra_body={"reasoning_effort": "off"}`: re-ranking is a mechanical
+ordering step, and on routes that default to thinking (e.g. DeepSeek V4 on
+CommandCode) the model would otherwise spend the small output budget on hidden
+reasoning — producing an empty response or hitting the 20 s timeout, then a
+keyword fallback. Providers that reject the field are retried without it by the
+auxiliary client's parameter-strip path.
+
 ### Backend Configurations (`backends`)
 
 Each entry in the `backends` list represents one search source.
@@ -530,6 +538,11 @@ v1.0.0 base plus the phase-2 and phase-3 improvements:
   strategy select moved into each line card (`pool_strategy` per line, the
   global key stays a read+write default); timeout / min_backends wording
   aligned with the runtime semantics.
+- **Included (v1.1.1):** the ranking call pins `reasoning_effort=off`
+  (`extra_body`) so thinking-capable routes (e.g. DeepSeek on CommandCode,
+  which defaults to thinking) cannot spend the small output budget on hidden
+  reasoning; the pin is stated in the card UI and the `plugin.yaml` ranker
+  description, and documented in README + `docs/agent-config.md`.
 - **Not included:** multi-card on registered providers (host interface takes
   no key) and direct credential-pool (`auth.json`) consumption — future
   increments; per-backend `timeout` / `weight` / `result_limit` —

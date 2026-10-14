@@ -575,6 +575,8 @@ def _rank_results(
     - Skip LLM ranking when <= _SKIP_RANK_IF results.
     - Truncate titles to 60 chars, descriptions to 80 chars.
     - Hard timeout via _RANK_TIMEOUT.
+    - Thinking is disabled on the LLM call (``reasoning_effort=off``): the
+      small output budget goes to the JSON array, not hidden reasoning.
     """
     if not results or len(results) <= _SKIP_RANK_IF:
         return results
@@ -627,6 +629,10 @@ def _rank_results(
             temperature=0,
             max_tokens=128,
             timeout=_RANK_TIMEOUT,
+            # Ranking is a mechanical ordering step: keep thinking-capable routes
+            # (e.g. DeepSeek on CommandCode defaults to thinking) from spending the
+            # small output budget on hidden reasoning — empty output / timeout.
+            extra_body={"reasoning_effort": "off"},
         )
 
         raw = (response.choices[0].message.content or "").strip()

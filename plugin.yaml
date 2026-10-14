@@ -1,5 +1,5 @@
 name: hermes-federated-search
-version: 1.1.0
+version: 1.1.1
 manifest_version: 2
 description: "Federated search — aggregate results from multiple search backends (Tavily, SearXNG, custom HTTP endpoints, etc.) with optional LLM-based relevance ranking and per-line multi-card credential pools. Configure via Settings → Plugins (card editor + Agent settings) or by editing the string (docs/agent-config.md)."
 author: kumaxs
@@ -50,4 +50,4 @@ config_schema:
     type: dict
     default: {}
     label: LLM 排序（ranker）
-    description: "provider/model 由卡片界面菜单写入；prompt 等既有键原样保留"
+    description: "provider/model 由卡片界面菜单写入；prompt 等既有键原样保留；重排序请求固定设置 reasoning_effort=off（关闭模型思考）"
