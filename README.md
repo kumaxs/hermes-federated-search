@@ -1,5 +1,7 @@
 # hermes-federated-search
 
+![Federated search flow: parallel fan-out to sub-backends, merge & dedupe, then relevance re-ranking (keyword fallback)](docs/assets/cover.png)
+
 **Federated** web search backend plugin for
 [Hermes Agent](https://github.com/NousResearch/hermes-agent). It fans out each
 search request to multiple configured sub-backends (Tavily, SearXNG, custom
