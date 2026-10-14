@@ -37,7 +37,7 @@ const PLUGIN_KEY = "hermes-federated-search";
 // loads the widget from the CLIENT machine while the gateway runs the agent
 // half, so the two halves can genuinely be different builds.
 // `tests/test_desktop_widget.py` fails the build when they drift.
-const WIDGET_VERSION = "1.1.0";
+const WIDGET_VERSION = "1.1.1";
 
 const CONFIG_HINT =
 	"凭据只录环境变量名；值请在 Settings → Keys 录入（PUT /api/env），不要写进 config.yaml。";
@@ -607,6 +607,7 @@ function rankerView(draft, catalog, handlers) {
 					})
 				] })
 			] }),
+			jsx("div", { className: "text-xs text-(--ui-text-tertiary)", children: "重排序请求固定设置 reasoning_effort=off（关闭模型思考）：排序更快更稳，避免超时回退关键词。" }),
 			phase === "empty"
 				? jsx("div", { className: "text-xs text-(--ui-text-tertiary)", children: "未配置任何 provider——ranker 只读现值，未改动则原样保留。" })
 				: null,

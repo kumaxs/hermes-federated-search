@@ -101,6 +101,9 @@ plugins:
   **整树合并**（`prompt` 等既有键原样保留）；清空选择＝删对应叶子。
 - `ranker` 读链：`settings.ranker` 优先；缺失回退 legacy `web.federated.ranker`。
   无现值时界面**零自动写入**（不会凭空创建 ranker 键）。
+- 重排序的辅助调用**固定设置 `reasoning_effort=off`（关闭模型思考）**：排序是机械步骤，
+  避免模型（如 CommandCode 上默认开启思考的 DeepSeek）把输出额度耗在思考上而超时回退；
+  不接受该字段的 provider，由辅助客户端自动去掉该字段重试。
 - 每卡「Key 轮换策略（`pool_strategy`，fill_first／round_robin／random）」＝写到**线路
   对象**内的 `pool_strategy`；「跟随全局」＝不写该键。全局 `pool_strategy`＝缺省值，
   仅在线路未给时生效（provider.py:721-723 → :970）；全局键保留读+写回，界面控件已
