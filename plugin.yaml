@@ -1,5 +1,5 @@
 name: hermes-federated-search
-version: 1.1.1
+version: 1.1.2
 manifest_version: 2
 description: "Federated search — aggregate results from multiple search backends (Tavily, SearXNG, custom HTTP endpoints, etc.) with optional LLM-based relevance ranking and per-line multi-card credential pools. Configure via Settings → Plugins (card editor + Agent settings) or by editing the string (docs/agent-config.md)."
 author: kumaxs
@@ -17,37 +17,43 @@ config_schema:
   backends:
     type: list
     default: []
-    label: 线路列表
-    description: "数组，元素为主机配置对象（name / type / base_url / api_key_env / credentials / required 等）"
+    label: Search lines
+    description: "Array of host config objects (name / type / base_url / api_key_env / credentials / required, …)"
   timeout:
     type: int
     default: 10
-    label: 超时（秒）
-    description: "等全部线路返回的总时限；到期未返回的线路丢弃、已返回的线路凑部分结果"
+    label: Timeout (seconds)
+    description: "Overall deadline for all lines to answer; lines that miss it are dropped, the lines that answered make up a partial result"
   max_results:
     type: int
     default: 8
-    label: 输出条数
-    description: "排序后返回的最大条数（实际输出 = min(limit, max_results)）"
+    label: Output size
+    description: "Maximum number of ranked results returned (effective output = min(limit, max_results))"
   min_backends:
     type: int
     default: 1
-    label: 最少成功线路
-    description: "本次「有结果返回」的线路数须 ≥N，不足则整次搜索失败；required 线路必须成功（1 ≤ N ≤ 线路数）"
+    label: Minimum successful lines
+    description: "A search succeeds only if at least N lines return results; required lines must always succeed (1 ≤ N ≤ line count)"
   ranking_mode:
     type: str
     choices: [auto, keyword, llm]
     default: auto
-    label: 排序方式
-    description: "auto=按 ranker 配置（未配置→关键词；配置→LLM＋失败回退关键词）；keyword=强制关键词；llm=强制 LLM（ranker.provider 未配时用默认辅助模型）"
+    label: Ranking mode
+    description: "auto = follow the ranker config (unset → keyword; set → LLM with keyword fallback on failure); keyword = force keyword; llm = force LLM (uses the default auxiliary model when ranker.provider is unset)"
   pool_strategy:
     type: str
     choices: [fill_first, round_robin, random]
     default: fill_first
-    label: 多卡使用策略（缺省全局）
-    description: "全局缺省轮换策略：线路卡内未给 pool_strategy 时生效（卡片界面已移入每条线路卡）"
+    label: Multi-key strategy (global default)
+    description: "Global default rotation strategy: used when a line card does not set pool_strategy (the control now lives on each line card)"
   ranker:
     type: dict
     default: {}
-    label: LLM 排序（ranker）
-    description: "provider/model 由卡片界面菜单写入；prompt 等既有键原样保留；重排序请求固定设置 reasoning_effort=off（关闭模型思考）"
+    label: LLM ranking (ranker)
+    description: "provider/model are written by the card editor; existing keys such as prompt are preserved; rerank requests always set reasoning_effort=off (model thinking off)"
+  ui_language:
+    type: str
+    choices: [en, zh]
+    default: en
+    label: Interface language
+    description: "Language of this plugin's interface copy: en (default) or zh (optional localisation). Does not affect search behaviour."
