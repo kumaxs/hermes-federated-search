@@ -1688,7 +1688,7 @@ class TestPoolIntegration:
 
 
 class TestConfigSchema:
-    """plugin.yaml declares the six settings-page keys per the host rules."""
+    """plugin.yaml declares the eight settings-page keys per the host rules."""
 
     def test_config_schema_keys_valid(self) -> None:
         import re
@@ -1703,7 +1703,7 @@ class TestConfigSchema:
         schema = data.get("config_schema")
         assert set(schema) == {
             "backends", "timeout", "max_results", "min_backends",
-            "ranking_mode", "pool_strategy", "ranker",
+            "ranking_mode", "pool_strategy", "ranker", "ui_language",
         }
         segment = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
         reserved = {"model", "plugins", "security", "settings"}
@@ -1722,6 +1722,9 @@ class TestConfigSchema:
         assert schema["ranking_mode"]["default"] == "auto"
         assert schema["pool_strategy"]["choices"] == ["fill_first", "round_robin", "random"]
         assert schema["pool_strategy"]["default"] == "fill_first"
+        # ui_language：桌面卡片页语言选择器写回 settings.ui_language，声明后才被宿主读写放行（plugins_settings.py:82-136）
+        assert schema["ui_language"]["choices"] == ["en", "zh"]
+        assert schema["ui_language"]["default"] == "en"
         # ranker 是 dict 键：UI 写入 settings.ranker 依赖 schema 放行（plugins_settings.py:116-140）
         assert str(schema["ranker"]["type"]).lower() == "dict"
         assert schema["ranker"]["default"] == {}
