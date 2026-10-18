@@ -13,7 +13,7 @@ search provider, 26 for the desktop widget — the widget tests spawn
   SDK, which is not published on PyPI — it is fetched from GitHub at the
   pinned commit `7e6f1c4060619beba1619ee9fd385ef7d8e0ca0a`
   (`kumaxs/hermes-agent`, branch `feat/federated-search-config`).
-- Test dependencies on PyPI: `pytest`, `ruamel.yaml` (see
+- Test dependencies on PyPI: `httpx`, `pytest`, `ruamel.yaml` (see
   `requirements-dev.txt`).
 
 ## Setup
@@ -94,9 +94,9 @@ errors or a batch of identical failure messages — see below.)
   re-run. `--import-mode=importlib` does not help.
 - **Collection aborts with `ModuleNotFoundError: No module named 'agent'`** —
   the hermes-agent SDK is not on `PYTHONPATH`. Do step 3–4 of Setup.
-- **A batch of failures with `Federated search failed: No module named 'ruamel'`** —
-  the test dependencies are not installed. Run
-  `pip install -r requirements-dev.txt`.
+- **A batch of failures with `No module named 'ruamel'` or
+  `No module named 'httpx'` in the messages** — the test dependencies are not
+  installed. Run `pip install -r requirements-dev.txt`.
 - **The desktop widget tests fail with a `node`-related error** — Node.js is
   not on PATH. Install Node.js (v22 tested) and re-run.
 
