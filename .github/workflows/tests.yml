@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}/sdk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: kumaxs/hermes-agent
+          ref: 7e6f1c4060619beba1619ee9fd385ef7d8e0ca0a
+          path: sdk
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install test dependencies
+        working-directory: repo
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run the test suite
+        working-directory: repo
+        run: python -m pytest tests -q -p no:cacheprovider
