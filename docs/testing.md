@@ -99,6 +99,39 @@ errors or a batch of identical failure messages — see below.)
   installed. Run `pip install -r requirements-dev.txt`.
 - **The desktop widget tests fail with a `node`-related error** — Node.js is
   not on PATH. Install Node.js (v22 tested) and re-run.
+- **`2 failed, 115 passed`, the failures being
+  `TestProviderIdentity::test_is_available_no_config` and
+  `TestConfigReading::test_read_config_no_federated`** — a leak from the host
+  configuration, not a regression. Both tests assert the "no federated
+  configuration" premise, and both read the process-level Hermes config
+  (`HERMES_HOME` → `$HERMES_HOME/config.yaml`, default `~/.hermes/config.yaml`)
+  with no test-level isolation. When that config contains a federated section —
+  `web.federated`, or `plugins.entries.hermes-federated-search.settings` —
+  `is_available()` returns `True` and `_read_config()` returns the real
+  mapping, so both assertions fail. Run the suite from a clean environment
+  instead of a Hermes-configured shell:
+
+  ```
+  env -i HOME="$HOME" PATH="$PATH" PYTHONPATH="$PYTHONPATH" \
+    PYTHONDONTWRITEBYTECODE=1 python -m pytest tests -q -p no:cacheprovider
+  ```
+
+  or keep the shell and point `HERMES_HOME` at an empty directory:
+
+  ```
+  HERMES_HOME="$(mktemp -d)" PYTHONDONTWRITEBYTECODE=1 \
+    python -m pytest tests -q -p no:cacheprovider
+  ```
+
+  Both forms print `117 passed`: the first drops every Hermes variable, the
+  second only the leaked config. To reproduce the failure deliberately, point
+  `HERMES_HOME` at a Hermes home whose `config.yaml` has a federated section,
+  e.g.:
+
+  ```
+  HERMES_HOME=~/.hermes/profiles/dev PYTHONDONTWRITEBYTECODE=1 \
+    python -m pytest tests -q -p no:cacheprovider
+  ```
 
 ## Continuous integration
 
