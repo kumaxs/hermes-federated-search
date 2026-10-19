@@ -248,7 +248,7 @@ The `ranker` section controls how merged results are ordered by relevance.
 |-----|------|---------|-------------|
 | `ranker.provider` | str | — | LLM provider for ranking. Set to `"none"` (or omit) for keyword-based scoring (fast, zero cost). Use a real provider (e.g., `"opencode-go"`) for LLM ranking. |
 | `ranker.model` | str | — | Model name for the ranking LLM (e.g., `"deepseek-v4-flash"`). |
-| `ranker.prompt` | str | — | Optional custom system prompt for the ranking LLM. Inject preferences like "prefer Chinese sources" or "prefer official documentation". When omitted, a default prompt is used. |
+| `ranker.prompt` | str | — | Optional custom system prompt for the ranking LLM. Inject preferences like "prefer Chinese sources" or "prefer official documentation". Card-page editable (the "Rerank prompt" box); when omitted, the built-in default prompt is used — the box shows that default as the effective value, and "Restore default" clears the key. |
 
 **Ranking modes:**
 
@@ -545,6 +545,13 @@ v1.0.0 base plus the phase-2 and phase-3 improvements:
   which defaults to thinking) cannot spend the small output budget on hidden
   reasoning; the pin is stated in the card UI and the `plugin.yaml` ranker
   description, and documented in README + `docs/agent-config.md`.
+- **Included (v1.1.3, branch `feat/rerank-prompt-config`):** the rerank prompt
+  becomes a first-class card-page field (`ranker.prompt`): the box shows the
+  effective value (the built-in default while unset), Save commits the text,
+  "Restore default" clears the leaf; an agent-facing note covers the entry
+  points and writing conventions (`docs/agent-config.md` § 重排提示词); the
+  widget's default-prompt copy is pinned by tests against the provider's
+  actual default system message.
 - **Not included:** multi-card on registered providers (host interface takes
   no key) and direct credential-pool (`auth.json`) consumption — future
   increments; per-backend `timeout` / `weight` / `result_limit` —

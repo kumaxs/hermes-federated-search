@@ -32,7 +32,7 @@ plugins:
         min_backends: 1
         ranking_mode: auto
         pool_strategy: fill_first   # 全局缺省值；卡内 pool_strategy 覆盖它
-        # ranker: { provider: …, model: …, prompt: … }   # LLM 排序（见下）
+        # ranker: { provider: …, model: …, prompt: … }   # LLM 排序；prompt＝重排提示词，写法见下
 ```
 
 - 旧的 `web.federated` 段仍然可用：读链按**顶层键**合并，`settings` 的键覆盖
@@ -98,8 +98,10 @@ plugins:
   `keyword`／`llm` 为强制模式。卡片页在 `auto`/`llm` 下显示「排序模型（ranker.model）」
   菜单（数据源＝桌面 host 的 `model.options`，目录不可用时菜单区给提示，可用下方字符串
   或 Agent settings 直接改键）。选择写入 `ranker.provider`／`ranker.model`；写回是
-  **整树合并**（`prompt` 等既有键原样保留）；清空选择＝删对应叶子。
-- `ranker` 读链：`settings.ranker` 优先；缺失回退 legacy `web.federated.ranker`。
+  **整树合并**：`provider`／`model`／`prompt` 为受管叶子（「重排提示词」框即写 `prompt`，
+  清空＝删该叶回内置默认），其余既有键原样保留。
+- `ranker` 读链：`settings.ranker` 优先；仅当 `settings.ranker` **整键**不存在时回退 legacy
+  `web.federated.ranker`（子键不合并）。
   无现值时界面**零自动写入**（不会凭空创建 ranker 键）。
 - 重排序的辅助调用**固定设置 `reasoning_effort=off`（关闭模型思考）**：排序是机械步骤，
   避免模型（如 CommandCode 上默认开启思考的 DeepSeek）把输出额度耗在思考上而超时回退；
@@ -110,6 +112,41 @@ plugins:
   移入每条线路卡内。
 - 旧卡兼容：`api_key_env` 单键卡与 `credentials` 多键卡并存；`required`、未知扩展键
   原样往返；`type` 缺失的行不注入 `type`、不改写为 `custom`。
+
+### 重排提示词（ranker.prompt）
+
+- 键：`plugins.entries.hermes-federated-search.settings.ranker.prompt`（字符串）。
+  legacy `web.federated.ranker.prompt` 仍可读——但仅当 `settings.ranker` 整键不存在；
+  `settings.ranker` 一出现即整体覆盖 legacy `ranker`（读链按顶层键合并，子键不合并）。
+- 语义：设置后作为重排调用的 system 提示词发送（其后由插件追加固定的输出要求
+  «Return ONLY a JSON array … No other text.»）；未设置＝内置默认提示词。
+  仅在 LLM 排序时生效（`ranking_mode: llm`，或 `auto` 且 `ranker.provider` 已设置）；
+  `keyword` 模式忽略。提示词**必须是字符串**——写成数字/布尔会让该次 LLM 排序异常并回退关键词。
+- 写法：只写偏好/规则（例「优先中文来源、优先官方文档」），不要写输出格式（插件固定追加）。
+  多行用 YAML 块标量：
+
+  ```yaml
+  plugins:
+    entries:
+      hermes-federated-search:
+        settings:
+          ranker:
+            provider: opencode-go
+            model: deepseek-v4-flash
+            prompt: |
+              优先中文来源和官方文档。
+              优先近 6 个月的结果。
+  ```
+
+- agent 写入（三条等价入口）：
+  1) 直改 config.yaml 上述路径（支持块标量）；
+  2) `hermes config set plugins.entries.hermes-federated-search.settings.ranker.prompt "优先中文来源"`——
+     免 `--force`；多行值会落成带 `\n` 转义的引号串（语义相同）；纯数字/布尔样值会被强转，勿用；
+  3) 恢复默认：`hermes config unset plugins.entries.hermes-federated-search.settings.ranker.prompt`
+     ——只删该叶子，`provider`/`model`/`backends` 等兄弟键保留。
+- 读入口：`hermes config get plugins.entries.hermes-federated-search.settings.ranker`；
+  界面侧＝「聚合搜索」卡片页「重排提示词」框 / Agent settings 子页。
+- 生效：下一次搜索即读新值（provider 每次现读 config.yaml，无需重启）。
 
 ## 改完之后，人能看到什么
 
