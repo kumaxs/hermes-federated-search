@@ -37,7 +37,17 @@ const PLUGIN_KEY = "hermes-federated-search";
 // loads the widget from the CLIENT machine while the gateway runs the agent
 // half, so the two halves can genuinely be different builds.
 // `tests/test_desktop_widget.py` fails the build when they drift.
-const WIDGET_VERSION = "1.1.2";
+const WIDGET_VERSION = "1.1.3";
+
+// The built-in rerank system prompt — the provider's unconfigured branch
+// (provider.py::_rank_results). The rerank-prompt box shows it as the
+// effective value while `ranker.prompt` is unset; a test pins this copy
+// against the provider's actual default system message, so they cannot drift.
+const DEFAULT_RANKER_PROMPT =
+	"You rank search results by relevance. Rules:\n" +
+	"- Return ONLY a JSON array of result indices ranked by relevance, e.g. [3,1,5,2,4]\n" +
+	"- Include ALL results. Most relevant first.\n" +
+	"- No other text.";
 
 // ---------------------------------------------------------------------------
 // Copy — every user-facing string, in two bundles. `en` is the primary (the
@@ -141,7 +151,16 @@ const COPY = {
 		"ranker.noProviders":
 			"No provider configured — the ranker stays read-only at its current value until edited.",
 		"ranker.autoNote":
-			"Not set: auto uses keyword; choosing a provider writes settings.ranker (existing keys such as prompt are kept).",
+			"Not set: auto uses keyword; choosing a provider writes settings.ranker (other ranker keys are kept).",
+		"ranker.promptLabel": "Rerank prompt (ranker.prompt)",
+		"ranker.promptHint":
+			"Sent as the ranking system prompt (the fixed JSON-array output requirement is appended); empty = the built-in default prompt. Used only when LLM ranking runs (auto with a provider, or llm).",
+		"ranker.promptUnset":
+			"Not set — the built-in default prompt is used (relevance order; output is a fixed JSON index array).",
+		"ranker.promptSave": "Save",
+		"ranker.promptReset": "Restore default (clear the key)",
+		"ranker.promptAgentNote":
+			"This item can also be configured by an agent: write the text to settings.ranker.prompt (full key plugins.entries.hermes-federated-search.settings.ranker.prompt; a YAML block scalar prompt: | works). Doors: \"Import from string\" on this page, the Agent settings sub-page, or the agent editing the config string — writing conventions in docs/agent-config.md.",
 		"options.heading": "Aggregation options",
 		"options.minBackends": "Min successful lines (min_backends)",
 		"options.minBackendsHint":
@@ -243,7 +262,16 @@ const COPY = {
 		"ranker.reasoning":
 			"重排序请求固定设置 reasoning_effort=off（关闭模型思考）：排序更快更稳，避免超时回退关键词。",
 		"ranker.noProviders": "未配置任何 provider——ranker 只读现值，未改动则原样保留。",
-		"ranker.autoNote": "未设置：auto 将走关键词；选择 provider 后写回 settings.ranker（prompt 等既有键保留）。",
+		"ranker.autoNote": "未设置：auto 将走关键词；选择 provider 后写回 settings.ranker（其余 ranker 键保留）。",
+		"ranker.promptLabel": "重排提示词（ranker.prompt）",
+		"ranker.promptHint":
+			"作为重排的 system 提示词发送（其后自动追加固定的 JSON 输出要求）；留空＝内置默认提示词。仅 LLM 排序（auto 且已选 provider，或 llm）使用。",
+		"ranker.promptUnset":
+			"未设置——使用内置默认提示词（按相关度排序；输出固定为 JSON 索引数组）。",
+		"ranker.promptSave": "保存",
+		"ranker.promptReset": "恢复默认（清除该项）",
+		"ranker.promptAgentNote":
+			"该项也可由 agent 配置：把文本写进 settings.ranker.prompt（完整路径 plugins.entries.hermes-federated-search.settings.ranker.prompt；YAML 可写多行块 prompt: |）。入口＝本页「从字符串导入」、Agent settings 子页，或 agent 直改配置字符串；写法见 docs/agent-config.md。",
 		"options.heading": "聚合选项",
 		"options.minBackends": "最少成功线路（min_backends）",
 		"options.minBackendsHint":
@@ -323,7 +351,7 @@ function asInt(value, fallback) {
 const owns = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 
 function emptyRanker() {
-	return { present: false, broken: false, tree: {}, provider: "", model: "" };
+	return { present: false, broken: false, tree: {}, provider: "", model: "", prompt: "" };
 }
 
 function emptyDraft() {
@@ -361,6 +389,7 @@ function readRanker(settingsRanker, legacyRanker, lang) {
 			ranker.tree = { ...source };
 			ranker.provider = asText(source.provider);
 			ranker.model = asText(source.model);
+			ranker.prompt = asText(source.prompt);
 		} else {
 			ranker.broken = true;
 			problems.push(t("problem.rankerNotObject", l, label));
@@ -369,20 +398,24 @@ function readRanker(settingsRanker, legacyRanker, lang) {
 	return { ranker, problems };
 }
 
-/** Ranker write: whole-tree merge (prompt and unknown keys stay), provider /
- *  model leaves replaced — a cleared select deletes its leaf. The key is
- *  omitted when nothing existed and nothing was chosen (no automatic write),
- *  and stays untouched when the read tree was not an object. */
+/** Ranker write: whole-tree merge (unknown keys stay), provider / model /
+ *  prompt leaves replaced — clearing a field deletes its leaf (restore
+ *  default); a blank prompt counts as unset. The key is omitted when nothing
+ *  existed and nothing was chosen (no automatic write), and stays untouched
+ *  when the read tree was not an object. */
 function rankerFromDraft(ranker) {
 	if (!ranker || ranker.broken) return undefined;
 	const tree = { ...(ranker.tree || {}) };
 	delete tree.provider;
 	delete tree.model;
+	delete tree.prompt;
 	const provider = asText(ranker.provider).trim();
 	const model = asText(ranker.model).trim();
+	const prompt = asText(ranker.prompt).trim();
 	if (provider) tree.provider = provider;
 	if (model) tree.model = model;
-	if (!ranker.present && !provider && !model) return undefined;
+	if (prompt) tree.prompt = prompt;
+	if (!ranker.present && !provider && !model && !prompt) return undefined;
 	return tree;
 }
 
@@ -556,7 +589,8 @@ function cloneDraft(draft) {
 			broken: !!(draft.ranker && draft.ranker.broken),
 			tree: { ...((draft.ranker && draft.ranker.tree) || {}) },
 			provider: draft.ranker ? asText(draft.ranker.provider) : "",
-			model: draft.ranker ? asText(draft.ranker.model) : ""
+			model: draft.ranker ? asText(draft.ranker.model) : "",
+			prompt: draft.ranker ? asText(draft.ranker.prompt) : ""
 		}
 	};
 }
@@ -800,6 +834,53 @@ function lineCardView(line, index, handlers, lang) {
 	);
 }
 
+/** Rerank prompt box: a local draft committed by Save. A multiline field must
+ *  not write on every keystroke — each write round-trips the settings tree and
+ *  re-reads it (SSOT), which would eat trailing whitespace mid-typing — so the
+ *  explicit Save is the commit point; Restore default clears the leaf. While
+ *  the leaf is unset the box shows the built-in default as the effective value
+ *  (placeholder), matching what the provider will send. */
+function RankerPromptBox({ value, onApply, onReset, lang }) {
+	const l = renderLang(lang);
+	const [text, setText] = useState(value);
+	useEffect(() => {
+		setText(value);
+	}, [value]);
+	return jsxs("div", { className: "grid gap-2", children: [
+		jsx("div", { className: "text-xs text-(--ui-text-secondary)", children: t("ranker.promptLabel", l) }),
+		jsx(Textarea, {
+			value: text,
+			placeholder: DEFAULT_RANKER_PROMPT,
+			"aria-label": "ranker.prompt",
+			className: "font-mono text-xs",
+			rows: 4,
+			onChange: (event) => setText(event.target.value)
+		}),
+		value === ""
+			? jsx("div", { className: "text-xs text-(--ui-text-tertiary)", children: t("ranker.promptUnset", l) })
+			: null,
+		jsx("div", { className: "text-xs text-(--ui-text-tertiary)", children: t("ranker.promptHint", l) }),
+		jsxs("div", { className: "flex flex-wrap items-center gap-2", children: [
+			jsx(Button, {
+				variant: "secondary",
+				size: "sm",
+				onClick: () => onApply(text),
+				children: t("ranker.promptSave", l)
+			}),
+			jsx(Button, {
+				variant: "ghost",
+				size: "sm",
+				onClick: () => {
+					setText("");
+					onReset();
+				},
+				children: t("ranker.promptReset", l)
+			})
+		]}),
+		jsx("div", { className: "text-xs text-(--ui-text-tertiary)", children: t("ranker.promptAgentNote", l) })
+	]});
+}
+
 function rankerView(draft, catalog, handlers, lang) {
 	const l = renderLang(lang);
 	const info = draft.ranker || emptyRanker();
@@ -852,6 +933,12 @@ function rankerView(draft, catalog, handlers, lang) {
 					})
 				] })
 			] }),
+			jsx(RankerPromptBox, {
+				value: info.prompt,
+				onApply: handlers.onRankerPromptApply,
+				onReset: handlers.onRankerPromptReset,
+				lang: l
+			}),
 			jsx("div", { className: "text-xs text-(--ui-text-tertiary)", children: t("ranker.reasoning", l) }),
 			phase === "empty"
 				? jsx("div", { className: "text-xs text-(--ui-text-tertiary)", children: t("ranker.noProviders", l) })
@@ -1209,6 +1296,12 @@ function ConfigPage() {
 			onRankerModel: (value) => {
 				if (state.draft) void write(updateRanker(state.draft, "model", value));
 			},
+			onRankerPromptApply: (value) => {
+				if (state.draft) void write(updateRanker(state.draft, "prompt", value));
+			},
+			onRankerPromptReset: () => {
+				if (state.draft) void write(updateRanker(state.draft, "prompt", ""));
+			},
 			onAddLine: () => {
 				if (state.draft) void write(addLine(state.draft));
 			},
@@ -1326,6 +1419,7 @@ export default {
 export const __test = {
 	PLUGIN_KEY,
 	WIDGET_VERSION,
+	DEFAULT_RANKER_PROMPT,
 	DEFAULT_OPTIONS,
 	POOL_INHERIT,
 	emptyDraft,

@@ -206,7 +206,7 @@ class RenderSmokeTest(unittest.TestCase):
 
     def test_lines_view_renders_cards_strings_and_string_section(self):
         text = self.report["lines"]
-        for token in ("tavily", "minimax", "TAVILY_API_KEY", "参与聚合", "＋ 添加 Key", "当前配置字符串"):
+        for token in ("tavily", "minimax", "TAVILY_API_KEY", "参与聚合", "＋ 添加 Key", "当前配置字符串", "重排提示词"):
             self.assertIn(token, text, f"lines view lost {token!r}")
         self.assertTrue(self.report["stringSection"])
 
@@ -228,6 +228,67 @@ class RenderSmokeTest(unittest.TestCase):
 
     def test_component_mounts_without_a_crash(self):
         self.assertIn("Loader", self.report["component"])
+
+
+class RerankPromptConfigTest(unittest.TestCase):
+    """⑥ 重排提示词配置框（ranker.prompt）：写回/删叶/空白归一/渲染/跨语言防漂移。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.compat = run_harness("compat")
+        cls.render = run_harness("render")
+        cls.roundtrip = run_harness("roundtrip")
+
+    def test_prompt_write_rules(self):
+        """保存写叶（整树合并不丢兄弟键）、恢复默认删叶、无现值不发明、空白按未设置。"""
+        rules = self.compat["promptRoundTrip"]
+        self.assertTrue(rules["promptWritten"], "a saved prompt did not reach settings.ranker")
+        self.assertTrue(rules["promptCleared"], "restore default did not delete the leaf")
+        self.assertTrue(rules["promptAbsentUntouched"], "a config without prompt got one invented")
+        self.assertTrue(rules["promptBlankNormalized"], "a blank prompt was written as a value")
+
+    def test_prompt_box_shows_the_effective_value(self):
+        """已设置＝当前值；未设置＝内置默认全文＋「未设置→内置默认」说明。"""
+        self.assertTrue(self.render["promptBoxOnLines"], "the prompt box is missing from the page")
+        self.assertTrue(self.render["promptSetShown"], "the current custom prompt is not shown")
+        self.assertTrue(self.render["promptUnsetShown"], "the unset state does not explain the built-in default")
+        self.assertTrue(self.render["defaultShownInUnset"], "the built-in default prompt text is not visible")
+        self.assertTrue(self.render["promptAgentNoteShown"], "the agent-facing note (entry + key path) is missing")
+
+    def test_prompt_box_hides_in_keyword_mode(self):
+        """ranking_mode=keyword：提示词框随 ranker 区一起不渲染（现状 gate）。"""
+        self.assertTrue(self.render["promptKeywordHidden"])
+
+    def test_prompt_survives_the_config_string(self):
+        """字符串门：draftToConfigText 含 prompt；回读等价（roundtrip 一并覆盖）。"""
+        self.assertTrue(self.roundtrip["stringHasPrompt"])
+        self.assertTrue(self.roundtrip["stringRoundTrip"])
+
+    def test_default_prompt_copy_matches_the_provider_baseline(self):
+        """跨语言 pin：widget 默认文本 === provider 未配置时实际发送的 system 消息。"""
+        from unittest.mock import MagicMock, patch
+
+        from provider import _rank_results
+
+        results = [
+            {"title": f"R{i}", "url": f"https://r{i}.com", "description": f"D{i}"}
+            for i in range(5)
+        ]
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock(message=MagicMock(content="[1,2,3,4,5]"))]
+
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=mock_response,
+        ) as mock_call:
+            _rank_results("test", results, {"provider": "opencode-go", "model": "deepseek-v4-flash"})
+            system_msg = mock_call.call_args[1]["messages"][0]["content"]
+
+        self.assertEqual(
+            self.render["defaultPrompt"],
+            system_msg,
+            "the widget default prompt drifts from the provider's default system message",
+        )
 
 
 class IllegalStateTest(unittest.TestCase):

@@ -754,6 +754,114 @@ class TestRankResultsCustomPrompt:
             assert kwargs["timeout"] == _RANK_TIMEOUT
             assert kwargs["extra_body"] == {"reasoning_effort": "off"}
 
+    def test_unconfigured_prompt_matches_the_default_baseline_byte_for_byte(self) -> None:
+        """未配置 ranker.prompt：system prompt 与改动前基线逐字一致（回归锚点）。"""
+        results = [
+            {"title": f"R{i}", "url": f"https://r{i}.com", "description": f"D{i}"}
+            for i in range(5)
+        ]
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="[2,1,3,4,5]"))
+        ]
+
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=mock_response,
+        ) as mock_call:
+            _rank_results(
+                "test",
+                results,
+                {"provider": "opencode-go", "model": "deepseek-v4-flash"},
+            )
+            system_msg = mock_call.call_args[1]["messages"][0]["content"]
+
+        assert system_msg == (
+            "You rank search results by relevance. Rules:\n"
+            "- Return ONLY a JSON array of result indices ranked by "
+            "relevance, e.g. [3,1,5,2,4]\n"
+            "- Include ALL results. Most relevant first.\n"
+            "- No other text."
+        )
+
+    def test_custom_prompt_gets_the_fixed_json_instruction(self) -> None:
+        """自定义 prompt：用户文本＋固定 JSON 输出后缀（后缀由插件追加，用户不必写）。"""
+        results = [
+            {"title": f"R{i}", "url": f"https://r{i}.com", "description": f"D{i}"}
+            for i in range(5)
+        ]
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="[5,4,3,2,1]"))
+        ]
+
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=mock_response,
+        ) as mock_call:
+            _rank_results(
+                "test",
+                results,
+                {"provider": "opencode-go", "prompt": "Prefer Chinese sources and official docs."},
+            )
+            system_msg = mock_call.call_args[1]["messages"][0]["content"]
+
+        assert system_msg == "Prefer Chinese sources and official docs." + (
+            "\n\nReturn ONLY a JSON array of result indices ranked by "
+            "relevance, e.g. [3,1,5,2,4]. Include ALL results. No other text."
+        )
+
+    def test_settings_prompt_reaches_the_next_rerank(self, tmp_path) -> None:
+        """保存即生效：settings.ranker.prompt 经读链进入下一次重排调用。"""
+        try:
+            import hermes_yaml as yaml
+        except ImportError:  # standalone checkout without the Hermes internal module
+            import yaml
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(yaml.safe_dump({
+            "plugins": {
+                "entries": {
+                    "hermes-federated-search": {
+                        "settings": {
+                            "backends": [{"name": "t", "type": "custom"}],
+                            "ranker": {
+                                "provider": "opencode-go",
+                                "prompt": "Prefer Chinese sources and official docs.",
+                            },
+                        },
+                    },
+                },
+            },
+        }))
+
+        from provider import _apply_ranking_mode
+
+        results = [
+            {"title": f"R{i}", "url": f"https://r{i}.com", "description": f"D{i}"}
+            for i in range(5)
+        ]
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="[2,1,3,4,5]"))
+        ]
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=mock_response,
+        ) as mock_call:
+            cfg = _read_config()
+            assert cfg is not None
+            assert cfg["ranker"]["prompt"] == "Prefer Chinese sources and official docs."
+            ranker = _apply_ranking_mode(cfg.get("ranker"), str(cfg.get("ranking_mode") or "auto"))
+            _rank_results("test", results, ranker)
+            system_msg = mock_call.call_args[1]["messages"][0]["content"]
+
+        assert system_msg == "Prefer Chinese sources and official docs." + (
+            "\n\nReturn ONLY a JSON array of result indices ranked by "
+            "relevance, e.g. [3,1,5,2,4]. Include ALL results. No other text."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Integration: required backends + min_backends
