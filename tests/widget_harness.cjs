@@ -143,7 +143,7 @@ function sampleValues() {
 		min_backends: 1,
 		ranking_mode: "auto",
 		pool_strategy: "fill_first",
-		ranker: { provider: "openai-codex", model: "gpt-6-luna", prompt: "keep me" }
+		ranker: { provider: "openai-codex", model: "gpt-6-luna", prompt: "keep me", x_note: "kept" }
 	};
 }
 
@@ -159,6 +159,8 @@ function handlers() {
 		onOption: noop,
 		onRankerProvider: noop,
 		onRankerModel: noop,
+		onRankerPromptApply: noop,
+		onRankerPromptReset: noop,
 		onAddLine: noop,
 		onAddKey: noop,
 		onExcludeLine: noop,
@@ -188,6 +190,7 @@ function modeRoundTrip() {
 		parseError: parsed.error,
 		idempotent: JSON.stringify(payload) === JSON.stringify(roundTripped),
 		stringRoundTrip: JSON.stringify(payload) === JSON.stringify(fromText),
+		stringHasPrompt: text.includes('"prompt": "keep me"'),
 		widgetShape: {
 			id: widget.id,
 			register: typeof widget.register,
@@ -243,16 +246,40 @@ function modeRender() {
 	const { test } = loadWidget(host);
 	const draft = test.draftFromValues(sampleValues()).draft;
 	const h = handlers();
+	const lines = textOf(test.linesView({ draft, k: null, handlers: h, note: null }));
+	// Rerank prompt box: the set fixture shows the current value; an unset
+	// prompt shows the built-in default as the effective value; keyword mode
+	// keeps the whole ranker section (box included) off the page.
+	const unsetDraft = test.draftFromValues({
+		backends: sampleValues().backends,
+		ranker: { provider: "openai-codex", model: "gpt-6-luna" }
+	}).draft;
+	const keywordDraft = { ...draft, options: { ...draft.options, ranking_mode: "keyword" } };
+	const keywordLines = textOf(test.linesView({ draft: keywordDraft, k: null, handlers: h, note: null }));
+	const rankerSet = textOf(test.rankerView(draft, { phase: "ready", providers: [] }, h, "zh"));
+	const rankerUnset = textOf(test.rankerView(unsetDraft, { phase: "ready", providers: [] }, h, "zh"));
 	return {
 		mode: "render",
-		lines: textOf(test.linesView({ draft, k: null, handlers: h, note: null })),
+		lines,
 		kWarning: textOf(test.linesView({ draft, k: 5, handlers: h, note: null })),
 		empty: textOf(test.emptyView()),
 		error: textOf(test.errorView("boom: settings unreadable")),
 		component: textOf(jsx(test.ConfigPage, {})),
-		stringSection: textOf(test.linesView({ draft, k: null, handlers: h, note: null })).includes(
-			"当前配置字符串"
-		)
+		stringSection: lines.includes("当前配置字符串"),
+		defaultPrompt: test.DEFAULT_RANKER_PROMPT,
+		promptBoxOnLines: lines.includes("重排提示词"),
+		promptSetShown:
+			rankerSet.includes("重排提示词") && rankerSet.includes("keep me") &&
+			rankerSet.includes("保存") && rankerSet.includes("恢复默认"),
+		promptUnsetShown:
+			rankerUnset.includes("重排提示词") && rankerUnset.includes("未设置") &&
+			rankerUnset.includes("内置默认"),
+		defaultShownInUnset: rankerUnset.includes(test.DEFAULT_RANKER_PROMPT),
+		promptAgentNoteShown:
+			lines.includes("也可由 agent 配置") &&
+			lines.includes("plugins.entries.hermes-federated-search.settings.ranker.prompt"),
+		promptKeywordHidden:
+			!keywordLines.includes("重排提示词") && keywordLines.includes("排序方式")
 	};
 }
 
@@ -305,7 +332,7 @@ function modeCompat() {
 			{ name: "searx", base_url: "https://api.example.invalid/searx" },
 			{ name: "reg", type: "registered" }
 		],
-		ranker: { provider: "openai-codex", model: "gpt-6-luna", prompt: "keep me" }
+		ranker: { provider: "openai-codex", model: "gpt-6-luna", prompt: "keep me", x_note: "kept" }
 	};
 	const loaded = test.draftFromValues(values);
 	const payload = test.settingsFromDraft(loaded.draft);
@@ -334,13 +361,41 @@ function modeCompat() {
 		!!payload.ranker &&
 		payload.ranker.provider === "openai-codex" &&
 		payload.ranker.model === "gpt-6-luna" &&
-		payload.ranker.prompt === "keep me";
+		payload.ranker.prompt === "keep me" &&
+		payload.ranker.x_note === "kept";
 	const rankerCleared =
 		!!clearedPayload.ranker &&
 		!has(clearedPayload.ranker, "provider") &&
 		clearedPayload.ranker.model === "gpt-6-luna" &&
-		clearedPayload.ranker.prompt === "keep me";
+		clearedPayload.ranker.prompt === "keep me" &&
+		clearedPayload.ranker.x_note === "kept";
 	const rankerOmitted = !has(test.settingsFromDraft(test.draftFromValues({ backends: [] }).draft), "ranker");
+
+	// Rerank prompt (ranker.prompt): a saved value writes the leaf and keeps
+	// its siblings; clearing deletes the leaf (restore default); a blank value
+	// normalizes to unset; a config without the key gets nothing invented.
+	const promptSet = test.settingsFromDraft(test.updateRanker(loaded.draft, "prompt", "Prefer Chinese sources"));
+	const promptWritten =
+		!!promptSet.ranker &&
+		promptSet.ranker.prompt === "Prefer Chinese sources" &&
+		promptSet.ranker.provider === "openai-codex" &&
+		promptSet.ranker.model === "gpt-6-luna" &&
+		promptSet.ranker.x_note === "kept";
+	const promptClearedPayload = test.settingsFromDraft(test.updateRanker(loaded.draft, "prompt", ""));
+	const promptCleared =
+		!!promptClearedPayload.ranker &&
+		!has(promptClearedPayload.ranker, "prompt") &&
+		promptClearedPayload.ranker.provider === "openai-codex" &&
+		promptClearedPayload.ranker.x_note === "kept";
+	const promptBlankPayload = test.settingsFromDraft(test.updateRanker(loaded.draft, "prompt", "   "));
+	const promptBlankNormalized = !has(promptBlankPayload.ranker, "prompt");
+	const noPromptPayload = test.settingsFromDraft(
+		test.draftFromValues({ backends: [], ranker: { provider: "openai-codex" } }).draft
+	);
+	const promptAbsentUntouched =
+		!!noPromptPayload.ranker &&
+		!has(noPromptPayload.ranker, "prompt") &&
+		noPromptPayload.ranker.provider === "openai-codex";
 
 	return {
 		mode: "compat",
@@ -354,7 +409,8 @@ function modeCompat() {
 		registeredKept: payload.backends[3].type === "registered",
 		typesRoundTrip: payload.backends[0].type === "custom" && payload.backends[1].type === undefined,
 		perLinePoolRoundTrip: { poolWritten, poolDeleted, poolEmptyKept },
-		rankerRoundTrip: { rankerKept, rankerCleared, rankerOmitted }
+		rankerRoundTrip: { rankerKept, rankerCleared, rankerOmitted },
+		promptRoundTrip: { promptWritten, promptCleared, promptAbsentUntouched, promptBlankNormalized }
 	};
 }
 

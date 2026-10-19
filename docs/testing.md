@@ -1,7 +1,7 @@
 # Running the tests
 
-The repository ships a single pytest suite: **117 tests** (91 for the federated
-search provider, 26 for the desktop widget — the widget tests spawn
+The repository ships a single pytest suite: **125 tests** (94 for the federated
+search provider, 31 for the desktop widget — the widget tests spawn
 `node tests/widget_harness.cjs` internally).
 
 ## Requirements
@@ -77,7 +77,7 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/test_desktop_widget.py -q -p no
 ## Expected output
 
 ```
-117 passed in 2.65s
+125 passed in 2.8s
 ```
 
 (The count grows as tests are added. A regression prints each failing test
@@ -113,7 +113,7 @@ full suite on every push and on every pull request:
 
 Where to see it: the repository's Actions tab → workflow `tests`, or the
 checks block on any pull request. Green signal: the run is green and the log
-ends with `117 passed`. Red signal: the run fails with the failing tests and
+ends with `125 passed`. Red signal: the run fails with the failing tests and
 their summaries in the log.
 
 To make it a merge gate, enable branch protection on the default branch and
