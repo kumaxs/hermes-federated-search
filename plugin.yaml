@@ -1,5 +1,5 @@
 name: hermes-federated-search
-version: 1.1.2
+version: 1.1.3
 manifest_version: 2
 description: "Federated search — aggregate results from multiple search backends (Tavily, SearXNG, custom HTTP endpoints, etc.) with optional LLM-based relevance ranking and per-line multi-card credential pools. Configure via Settings → Plugins (card editor + Agent settings) or by editing the string (docs/agent-config.md)."
 author: kumaxs
@@ -50,7 +50,7 @@ config_schema:
     type: dict
     default: {}
     label: LLM ranking (ranker)
-    description: "provider/model are written by the card editor; existing keys such as prompt are preserved; rerank requests always set reasoning_effort=off (model thinking off)"
+    description: "provider/model/prompt are written by the card editor (prompt is optional; empty = the built-in default); other existing keys are preserved; rerank requests always set reasoning_effort=off (model thinking off)"
   ui_language:
     type: str
     choices: [en, zh]
